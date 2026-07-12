@@ -68,7 +68,7 @@ from report_engine import PanelDataService, ReportHTMLRenderer, export_panel_xls
 
 
 APP_TITLE = "Sistema de Facturación Médica"
-VERSION = "2.1.0"
+VERSION = "2.6.1"
 
 # En modo ejecutable PyInstaller, los recursos viven temporalmente en _MEI,
 # mientras que reportes, recibos y logs se guardan junto al ejecutable.
@@ -1443,11 +1443,12 @@ def set_button_role(button: QPushButton, role: str):
         'warning': ('#ef6c00', '#c25e00'),
         'info': ('#1565c0', '#0d47a1'),
         'report': ('#6a1b9a', '#4a148c'),
-        'neutral': ('#455a64', '#263238'),
+        'neutral': ('#e7edf3', '#d5e0ea'),
     }
     base, hover = palette.get(role, ('#1e88e5', '#1565c0'))
+    border = "1px solid #c4d0dc" if role == 'neutral' else "none"
     button.setStyleSheet(
-        f"QPushButton {{ background-color: {base}; color: {'#212529' if role == 'neutral' else 'white'}; border: none; border-radius: 6px; padding: 8px 12px; font-weight: 600; }}"
+        f"QPushButton {{ background-color: {base}; color: {'#263238' if role == 'neutral' else 'white'}; border: {border}; border-radius: 6px; padding: 8px 12px; font-weight: 600; }}"
         f"QPushButton:hover {{ background-color: {hover}; }}"
         f"QPushButton:disabled {{ background-color: #b0bec5; color: #757575; }}"
     )
@@ -1458,6 +1459,131 @@ def _clean_name(s: str):
     s = re.sub(r'[\s\-\–\—\|\:]+$', '', s).strip()
     s = re.sub(r'\s+', ' ', s)
     return s
+
+
+CATALOG_SPELLING_CORRECTIONS = {
+    "ACIDO": "ÁCIDO",
+    "ACETILISTEINA": "ACETILCISTEÍNA",
+    "ACETLCISTEINA": "ACETILCISTEÍNA",
+    "AMITROTILINA": "AMITRIPTILINA",
+    "AMOXICIINA": "AMOXICILINA",
+    "CALVULAMICO": "CLAVULÁNICO",
+    "CANULA": "CÁNULA",
+    "CATETER": "CATÉTER",
+    "CARVELIDOL": "CARVEDILOL",
+    "CEFEPINE": "CEFEPIMA",
+    "CEFTRIAZONA": "CEFTRIAXONA",
+    "CIPROFLAXACINA": "CIPROFLOXACINA",
+    "DEXAMETOZONA": "DEXAMETASONA",
+    "DIAZEPAN": "DIAZEPAM",
+    "DICLOXOCILINA": "DICLOXACILINA",
+    "EPINEFINA": "EPINEFRINA",
+    "ESTERIL": "ESTÉRIL",
+    "ERITROPROYECTINA": "ERITROPOYETINA",
+    "FENTANYLO": "FENTANILO",
+    "GANMAGLOBULINA": "GAMMAGLOBULINA",
+    "IBERSARTAN": "IRBESARTÁN",
+    "IBUPREFENO": "IBUPROFENO",
+    "IMIPENEN": "IMIPENEM",
+    "KETEROLACO": "KETOROLACO",
+    "LEVETITACETAM": "LEVETIRACETAM",
+    "MEROPENEN": "MEROPENEM",
+    "MIDAZOLAN": "MIDAZOLAM",
+    "OMEPREZOL": "OMEPRAZOL",
+    "OXIGENO": "OXÍGENO",
+    "PEDIATRICO": "PEDIÁTRICO",
+    "QUIROFANO": "QUIRÓFANO",
+    "RISPERIDENA": "RISPERIDONA",
+    "SOLUCION DESTROSA": "SOLUCIÓN DEXTROSA",
+    "SOLUCION": "SOLUCIÓN",
+    "SULFATO DE MAGENSIO": "SULFATO DE MAGNESIO",
+    "SURFARCTANTE": "SURFACTANTE",
+    "SEVOFLUXANO": "SEVOFLURANO",
+    "TRIMETROPIN": "TRIMETOPRIM",
+    "VIAS": "VÍAS",
+}
+
+
+def normalize_catalog_name(raw_name: str) -> str:
+    """Normaliza nombres importados sin alterar dosis, tamaños ni marcas."""
+    name = str(raw_name or "").strip().upper()
+    name = re.sub(r"^[\s•·●▪◦*\-–—]+", "", name)
+    name = name.replace("“", '"').replace("”", '"').replace("''", '""')
+    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"\(\s+", "(", name)
+    name = re.sub(r"\s+\)", ")", name)
+    name = re.sub(r"\s*/\s*", "/", name)
+    for incorrect, correct in CATALOG_SPELLING_CORRECTIONS.items():
+        name = re.sub(rf"\b{re.escape(incorrect)}\b", correct, name)
+    return name.strip(" -–—,.;")
+
+
+def catalog_identity_key(raw_name: str) -> str:
+    """Compara ítems ignorando viñetas, acentos y espacios de formato."""
+    normalized = remove_accents(normalize_catalog_name(raw_name)).casefold()
+    return re.sub(r"[^a-z0-9]+", "", normalized)
+
+
+def _ditto_base(previous_name: str) -> str:
+    """Obtiene el nombre base para líneas Word que usan comillas de repetición."""
+    base = normalize_catalog_name(previous_name)
+    base = re.sub(r"\s+(?:#\s*)?\d+(?:[.,]\d+)?\s*$", "", base)
+    return base.strip()
+
+
+def _parse_word_price_token(token: str):
+    """Interpreta separadores dominicanos sin confundir 3.400 con 3.40."""
+    value = str(token or "").strip().replace(" ", "")
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", value):
+        value = value.replace(".", "")
+    return _parse_price(value)
+
+
+def parse_universal_catalog_line(raw_text: str, previous_name: str = "") -> list[tuple[str, float]]:
+    """Convierte una línea Word en uno o varios ítems independientes."""
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+    text = text.replace("RD$", "$")
+    ditto = bool(re.match(r'^\s*(?:""|″|〃)', text))
+    if ditto:
+        text = re.sub(r'^\s*(?:""|″|〃)\s*', f"{_ditto_base(previous_name)} ", text, count=1)
+
+    prices = list(re.finditer(r"\$\s*([0-9][0-9.,]*)", text))
+    if not prices:
+        return []
+
+    upper = remove_accents(text).upper()
+    is_multi_sonda = "SONDA" in upper and "VIA" in upper and len(prices) > 1
+    if is_multi_sonda:
+        first_prefix = text[:prices[0].start()]
+        base_match = re.match(r"^(.*?\b(?:2|3)\s*V[IÍ]AS?)\b(.*)$", first_prefix, re.I)
+        base = normalize_catalog_name(base_match.group(1) if base_match else first_prefix)
+        variants = []
+        prior_end = len(base_match.group(1)) if base_match else 0
+        for index, match in enumerate(prices):
+            segment_start = prior_end if index == 0 else prices[index - 1].end()
+            variant_text = text[segment_start:match.start()]
+            size = re.findall(r"#?\s*(\d+(?:[.,]\d+)?)", variant_text)
+            if not size:
+                continue
+            price = _parse_word_price_token(match.group(1))
+            if price is not None:
+                variants.append((f"{base} (#{size[-1]})", float(price)))
+        return variants
+
+    # Explicaciones como "equivale a $ 2.60" no son el precio del ítem;
+    # el precio final de la línea es el que se importa.
+    match = prices[-1]
+    price = _parse_word_price_token(match.group(1))
+    if price is None:
+        return []
+    before = text[:match.start()].strip()
+    after = text[match.end():].strip(" ,;.-")
+    if after:
+        before = f"{before} {after}"
+    name = normalize_catalog_name(_clean_name(before))
+    return [(name, float(price))] if name else []
 
 def open_file_path(path: str) -> bool:
     try:
@@ -3501,24 +3627,31 @@ def safe_generate_pending_reports(username: str):
 def import_word_to_universal_catalog(path: str):
     parsed = parse_word_for_universal_categories(path)
     summary = {cat: {"updated": 0, "inserted": 0} for cat in UNIVERSAL_CATEGORIES}
-    existing_maps = {
-        "Medicamentos": {name.strip().casefold(): name for name in get_universal("Medicamentos").keys()},
-        "Materiales": {name.strip().casefold(): name for name in get_universal("Materiales").keys()},
-    }
+    existing_maps = {cat: {} for cat in UNIVERSAL_CATEGORIES}
+    for cat in UNIVERSAL_CATEGORIES:
+        for existing_name in get_universal(cat).keys():
+            existing_maps[cat].setdefault(catalog_identity_key(existing_name), []).append(existing_name)
     with db_connect() as con:
         for cat in UNIVERSAL_CATEGORIES:
             for name, price in parsed[cat]:
-                key = name.casefold()
-                display_name = existing_maps[cat].get(key, name)
+                display_name = normalize_catalog_name(name)
+                key = catalog_identity_key(display_name)
+                previous_names = list(existing_maps[cat].get(key, []))
+                for previous_name in previous_names:
+                    if previous_name != display_name:
+                        con.execute(
+                            "UPDATE universal_items SET is_active=0 WHERE categoria=%s AND nombre=%s",
+                            (cat, previous_name),
+                        )
                 con.execute(
                     "INSERT INTO universal_items(categoria, nombre, precio, is_active) VALUES(%s,%s,%s, 1) "
                     "ON CONFLICT(categoria, nombre) DO UPDATE SET precio=EXCLUDED.precio, is_active=1",
                     (cat, display_name.strip(), float(price))
                 )
-                if key in existing_maps[cat]: summary[cat]["updated"] += 1
+                if previous_names: summary[cat]["updated"] += 1
                 else:
                     summary[cat]["inserted"] += 1
-                    existing_maps[cat][key] = display_name
+                existing_maps[cat][key] = [display_name]
     return summary
 
 def import_word_to_ars_catalog(path: str, ars_name: str):
@@ -3552,14 +3685,17 @@ def import_word_to_ars_catalog(path: str, ars_name: str):
 def parse_word_for_universal_categories(path: str):
     if Document is None: raise RuntimeError("Falta dependencia python-docx")
     doc = Document(path); parsed = {"Medicamentos": [], "Materiales": []}; current_cat = None
+    previous_names = {"Medicamentos": "", "Materiales": ""}
     def push(cat: str, raw_name: str, raw_price_text: str):
         if cat not in UNIVERSAL_CATEGORIES: return
         if _looks_like_month_or_month_year(raw_name): return
-        name = _clean_name(raw_name)
-        if not name: return
-        price = _parse_price(raw_price_text)
-        if price is None: return
-        parsed[cat].append((name, apply_price_rule(cat, price)))
+        combined = str(raw_name or "")
+        if "$" not in combined and raw_price_text:
+            combined = f"{combined} ${raw_price_text}"
+        entries = parse_universal_catalog_line(combined, previous_names.get(cat, ""))
+        for name, price in entries:
+            parsed[cat].append((name, apply_price_rule(cat, price)))
+            previous_names[cat] = name
     for tbl in doc.tables:
         for row in tbl.rows:
             cells = [c.text.strip() for c in row.cells]
@@ -3581,10 +3717,11 @@ def parse_word_for_universal_categories(path: str):
         if maybe_cat: current_cat = maybe_cat; continue
         m = re.match(r'^\s*(?P<cat>Medicamentos?|Materiales?)\s*[:\\-|]\s*(?P<name>.+?)\s*[:\\-|]\s*(?P<price>.+?)\s*$', txt, re.I)
         if m: push(_norm_cat(m.group('cat')), m.group('name').strip(), m.group('price')); continue
-        if ('$' in txt or re.search(r'\d', txt)) and current_cat: push(current_cat, txt, txt)
+        if '$' in txt and current_cat: push(current_cat, txt, txt)
     dedup = {"Medicamentos": {}, "Materiales": {}}
     for cat in parsed:
-        for name, price in parsed[cat]: dedup[cat][name.casefold()] = (name, price)
+        # Si el Word repite un ítem, conserva únicamente la última aparición.
+        for name, price in parsed[cat]: dedup[cat][catalog_identity_key(name)] = (name, price)
     return {cat: list(dedup[cat].values()) for cat in dedup}
 
 def parse_word_for_ars_categories(path: str):
@@ -3650,7 +3787,7 @@ class QtyDialog(QDialog):
         super().__init__(parent)
         self.parent_ref = parent
         self.setWindowTitle("Modificar cantidad")
-        self.setFixedSize(360, 150)
+        self.setFixedSize(360, 170)
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 18, 24, 18)
         root.setSpacing(14)
@@ -3660,7 +3797,7 @@ class QtyDialog(QDialog):
         root.addWidget(lbl, alignment=Qt.AlignLeft)
 
         spin_container = QHBoxLayout()
-        spin_container.setSpacing(8)
+        spin_container.setSpacing(6)
 
         self.spin = QSpinBox()
         self.spin.setRange(1, 9999)
@@ -3670,8 +3807,8 @@ class QtyDialog(QDialog):
         self.spin.setStyleSheet(f"""
             QSpinBox {{
                 border: 1px solid {'#555' if is_dark else '#aaa'};
-                border-radius: 4px;
-                padding: 5px 10px;
+                border-radius: 6px;
+                padding: 5px 12px;
                 font-size: 11pt;
                 min-height: 28px;
                 background: {'#2d2d2d' if is_dark else '#f8f9fa'};
@@ -3679,56 +3816,50 @@ class QtyDialog(QDialog):
             }}
         """)
 
-        btn_up = QToolButton()
-        btn_up.setText("▲")
-        btn_up.setFixedSize(28, 28)
-        btn_up.setStyleSheet(f"""
-            QToolButton {{
-                border: 1px solid {'#555' if is_dark else '#666'};
-                border-radius: 4px;
-                background: {'#4a5568' if is_dark else '#444444'};
-                color: white;
-                font-weight: bold;
-                font-size: 10pt;
-            }}
-            QToolButton:hover {{ background: {'#718096' if is_dark else '#555555'}; }}
-        """)
-        btn_up.clicked.connect(lambda: self.spin.setValue(self.spin.value() + 1))
+        self.spin.setFixedWidth(110)
 
         btn_down = QToolButton()
-        btn_down.setText("▼")
-        btn_down.setFixedSize(28, 28)
+        btn_down.setText("−")
+        btn_down.setToolTip("Disminuir cantidad")
+        btn_down.setFixedSize(40, 40)
         btn_down.setStyleSheet(f"""
             QToolButton {{
-                border: 1px solid {'#555' if is_dark else '#666'};
-                border-radius: 4px;
-                background: {'#4a5568' if is_dark else '#444444'};
-                color: white;
+                border: 1px solid {'#555' if is_dark else '#c4d0dc'};
+                border-radius: 6px;
+                background: {'#37474f' if is_dark else '#e7edf3'};
+                color: {'white' if is_dark else '#263238'};
                 font-weight: bold;
-                font-size: 10pt;
+                font-size: 16pt;
             }}
-            QToolButton:hover {{ background: {'#718096' if is_dark else '#555555'}; }}
+            QToolButton:hover {{ background: {'#455a64' if is_dark else '#d5e0ea'}; }}
         """)
         btn_down.clicked.connect(lambda: self.spin.setValue(max(1, self.spin.value() - 1)))
 
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(4)
-        btn_col.addWidget(btn_up)
-        btn_col.addWidget(btn_down)
-        
+        btn_up = QToolButton()
+        btn_up.setText("+")
+        btn_up.setToolTip("Aumentar cantidad")
+        btn_up.setFixedSize(40, 40)
+        btn_up.setStyleSheet(btn_down.styleSheet())
+        btn_up.clicked.connect(lambda: self.spin.setValue(self.spin.value() + 1))
+
         spin_container.addStretch()
-        spin_container.addLayout(btn_col)
+        spin_container.addWidget(btn_down)
         spin_container.addWidget(self.spin)
+        spin_container.addWidget(btn_up)
         spin_container.addStretch()
         root.addLayout(spin_container)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.setStyleSheet("font-size: 10pt;")
+        btn_ok = btns.button(QDialogButtonBox.Ok)
+        btn_cancel = btns.button(QDialogButtonBox.Cancel)
+        btn_ok.setText("Aceptar")
+        btn_cancel.setText("Cancelar")
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
-        for btn in btns.buttons():
-            set_button_role(btn, 'success' if btn.text().lower().startswith('ok') else 'neutral')
+        set_button_role(btn_ok, 'success')
+        set_button_role(btn_cancel, 'neutral')
 
 class RegisterUserDialog(QDialog):
     def __init__(self, parent=None, allow_role_choice=False):
@@ -4014,7 +4145,7 @@ class AddCatalogItemDialog(QDialog):
         self.category = category if category in ALL_CATEGORIES else "Medicamentos"
         self.ars_name = str(ars_name or "").strip()
         self.allow_category_navigation = bool(allow_category_navigation)
-        self.setMinimumSize(660, 470 if self.allow_category_navigation else 360)
+        self.setMinimumSize(660, 420 if self.allow_category_navigation else 340)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 20, 22, 20)
@@ -4022,6 +4153,7 @@ class AddCatalogItemDialog(QDialog):
 
         title = QLabel("Agregar ítem al catálogo" if self.allow_category_navigation else "Editar ítem")
         title.setStyleSheet("font-size: 18pt; font-weight: 900; color: #123F83;")
+        title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         lay.addWidget(title)
 
         subtitle = QLabel(
@@ -4031,15 +4163,20 @@ class AddCatalogItemDialog(QDialog):
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #607289; font-size: 10.5pt;")
+        subtitle.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         lay.addWidget(subtitle)
 
         if self.allow_category_navigation:
             navigation = QHBoxLayout()
-            self.btn_previous = QPushButton("◀ Anterior")
+            self.btn_previous = QPushButton("Anterior")
+            self.btn_previous.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
+            self.btn_previous.setToolTip("Ir a la categoría anterior")
             self.category_combo = QComboBox()
             self.category_combo.addItems(ALL_CATEGORIES)
             self.category_combo.setCurrentText(self.category)
-            self.btn_next = QPushButton("Siguiente ▶")
+            self.btn_next = QPushButton("Siguiente")
+            self.btn_next.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
+            self.btn_next.setToolTip("Ir a la categoría siguiente")
             navigation.addWidget(self.btn_previous)
             navigation.addWidget(self.category_combo, 1)
             navigation.addWidget(self.btn_next)
@@ -4052,7 +4189,9 @@ class AddCatalogItemDialog(QDialog):
 
         self.destination_panel = QLabel()
         self.destination_panel.setWordWrap(True)
-        self.destination_panel.setMinimumHeight(92)
+        self.destination_panel.setMinimumHeight(72)
+        self.destination_panel.setMaximumHeight(78)
+        self.destination_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.destination_panel.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         lay.addWidget(self.destination_panel)
 
@@ -4088,6 +4227,8 @@ class AddCatalogItemDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.btn_save = btns.button(QDialogButtonBox.Save)
         self.btn_save.setText("Guardar")
+        self.btn_cancel = btns.button(QDialogButtonBox.Cancel)
+        self.btn_cancel.setText("Cancelar")
         btns.accepted.connect(self.confirm_and_accept)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
@@ -4134,14 +4275,14 @@ class AddCatalogItemDialog(QDialog):
             catalog_type = "CATÁLOGO POR ARS"
             destination = f"ARS de destino: {self.ars_name or 'NO SELECCIONADA'}"
         self.destination_panel.setText(
-            f"DESTINO SELECCIONADO\n{self.category}\n{catalog_type}  •  {destination}"
+            f"DESTINO  ·  {self.category}\n{catalog_type}  •  {destination}"
         )
         self.destination_panel.setStyleSheet(
             f"QLabel {{ background: {color}; color: white; border-radius: 10px; "
-            "padding: 13px 17px; font-size: 11pt; font-weight: 800; }}"
+            "padding: 11px 15px; font-size: 10.5pt; font-weight: 800; }}"
         )
         suffix = f" · {self.ars_name}" if self.category in ARS_CATEGORIES else ""
-        self.btn_save.setText(f"Guardar en {self.category}{suffix}")
+        self.btn_save.setText("Guardar ítem")
         self.setWindowTitle(f"Agregar en {self.category}{suffix}")
 
     def confirm_and_accept(self):
@@ -4192,14 +4333,20 @@ class CatalogEditorDialog(QDialog):
 
         self.setMinimumSize(900, 640)
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
 
         nav_row = QHBoxLayout()
         self.category_combo = QComboBox()
         self.category_combo.addItems(ALL_CATEGORIES)
         self.category_combo.setCurrentText(self.category)
 
-        self.btn_prev_category = QPushButton("◀ Anterior")
-        self.btn_next_category = QPushButton("Siguiente ▶")
+        self.btn_prev_category = QPushButton("Anterior")
+        self.btn_prev_category.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
+        self.btn_next_category = QPushButton("Siguiente")
+        self.btn_next_category.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
+        self.btn_prev_category.setToolTip("Ir a la categoría anterior")
+        self.btn_next_category.setToolTip("Ir a la categoría siguiente")
 
         self.lbl_ars_context = QLabel("")
         self.lbl_ars_context.setStyleSheet("font-weight: bold; color: #1565c0;")
@@ -4217,18 +4364,23 @@ class CatalogEditorDialog(QDialog):
         lay.addWidget(self.search_edit)
 
         self.table = QTableWidget(0, 2)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        self.table.setColumnWidth(1, 120)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 140)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.itemChanged.connect(self._mark_dirty)
         lay.addWidget(self.table)
 
         actions = QHBoxLayout()
-        self.btn_clear_prices = QPushButton("Eliminar precios (0)")
-        self.btn_delete_rows = QPushButton("Eliminar seleccionado(s)")
+        self.btn_clear_prices = QPushButton("Poner precio en RD$ 0.00")
+        self.btn_delete_rows = QPushButton("Eliminar selección")
+        self.btn_clear_prices.setToolTip("Asigna RD$ 0.00 a los precios seleccionados; se aplica al guardar")
+        self.btn_delete_rows.setToolTip("Elimina los elementos seleccionados del catálogo")
         actions.addWidget(self.btn_clear_prices)
         actions.addWidget(self.btn_delete_rows)
         actions.addStretch(1)
@@ -4237,8 +4389,11 @@ class CatalogEditorDialog(QDialog):
         bottom = QHBoxLayout()
         self.btn_save_changes = QPushButton("Guardar cambios")
         self.btn_close = QPushButton("Cerrar")
-        bottom.addWidget(self.btn_save_changes)
+        self.lbl_pending_changes = QLabel("Sin cambios pendientes")
+        self.lbl_pending_changes.setStyleSheet("color: #607289; font-weight: 600;")
+        bottom.addWidget(self.lbl_pending_changes)
         bottom.addStretch(1)
+        bottom.addWidget(self.btn_save_changes)
         bottom.addWidget(self.btn_close)
         lay.addLayout(bottom)
 
@@ -4249,6 +4404,7 @@ class CatalogEditorDialog(QDialog):
         self.btn_delete_rows.clicked.connect(self.delete_selected_rows)
         self.btn_save_changes.clicked.connect(lambda: self.save_changes(close_after=False))
         self.btn_close.clicked.connect(self.close)
+        self.table.itemSelectionChanged.connect(self._update_selection_actions)
 
         set_button_role(self.btn_prev_category, 'neutral')
         set_button_role(self.btn_next_category, 'neutral')
@@ -4259,6 +4415,8 @@ class CatalogEditorDialog(QDialog):
 
         self._update_dialog_context()
         self.load_rows()
+        self._update_selection_actions()
+        self._update_dirty_state()
 
     def _singular_label(self, category: str) -> str:
         labels = {
@@ -4274,6 +4432,22 @@ class CatalogEditorDialog(QDialog):
     def _mark_dirty(self, *_args):
         if not self._loading:
             self._dirty = True
+            self._update_dirty_state()
+
+    def _update_dirty_state(self):
+        dirty = bool(getattr(self, "_dirty", False))
+        self.btn_save_changes.setEnabled(dirty)
+        self.lbl_pending_changes.setText("● Hay cambios sin guardar" if dirty else "Sin cambios pendientes")
+        self.lbl_pending_changes.setStyleSheet(
+            "color: #c25e00; font-weight: 800;" if dirty else "color: #607289; font-weight: 600;"
+        )
+
+    def _update_selection_actions(self):
+        count = len({index.row() for index in self.table.selectedIndexes()})
+        self.btn_clear_prices.setEnabled(count > 0)
+        self.btn_delete_rows.setEnabled(count > 0)
+        self.btn_clear_prices.setText(f"Poner precio en RD$ 0.00 ({count})")
+        self.btn_delete_rows.setText(f"Eliminar selección ({count})")
 
     def _update_dialog_context(self):
         suffix = f" - {self.ars_name}" if self.category in ARS_CATEGORIES and self.ars_name else ""
@@ -4348,9 +4522,13 @@ class CatalogEditorDialog(QDialog):
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(r, 0, name_item)
             shown_price = get_effective_price(self.category, price)
-            self.table.setItem(r, 1, QTableWidgetItem(f"{shown_price:.2f}"))
+            price_item = QTableWidgetItem(f"{shown_price:,.2f}")
+            price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(r, 1, price_item)
         self._loading = False
         self._dirty = False
+        self._update_dirty_state()
+        self._update_selection_actions()
 
     def clear_selected_prices(self):
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
@@ -4365,11 +4543,25 @@ class CatalogEditorDialog(QDialog):
             else:
                 item.setText("0.00")
         self._dirty = True
+        self._update_dirty_state()
 
     def delete_selected_rows(self):
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
         if not rows:
             FloatingToast("Selecciona al menos una fila", self, is_error=True).show()
+            return
+        names = [self.table.item(r, 0).text().strip() for r in rows]
+        preview = "\n".join(f"• {name}" for name in names[:5])
+        if len(names) > 5:
+            preview += f"\n• … y {len(names) - 5} más"
+        answer = QMessageBox.question(
+            self,
+            "Confirmar eliminación",
+            f"Se eliminarán {len(names)} elemento(s) de {self.category}:\n\n{preview}\n\n¿Deseas continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         with db_connect() as con:
             for r in rows:
@@ -4381,6 +4573,8 @@ class CatalogEditorDialog(QDialog):
                 self.table.removeRow(r)
         self.has_changes = True
         self._dirty = False
+        self._update_dirty_state()
+        self._update_selection_actions()
         FloatingToast("✅ Ítem(s) eliminado(s)", self).show()
 
     def save_changes(self, close_after: bool = False, silent: bool = False) -> bool:
@@ -4418,6 +4612,7 @@ class CatalogEditorDialog(QDialog):
                         )
             self.has_changes = True
             self._dirty = False
+            self._update_dirty_state()
             if not silent:
                 FloatingToast("✅ Cambios guardados correctamente", self).show()
             if close_after:
@@ -4449,8 +4644,17 @@ class ARSManagerDialog(QDialog):
         super().__init__(parent)
         self.current_user = current_user
         self.setWindowTitle("Gestión de ARS")
-        self.setMinimumSize(820, 340)
+        self.setMinimumSize(720, 460)
+        self.resize(860, 540)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        title = QLabel("Gestión de ARS")
+        title.setStyleSheet("font-size: 18pt; font-weight: 900; color: #123F83;")
+        subtitle = QLabel("Configura tarifas, catálogos e importaciones de cada aseguradora.")
+        subtitle.setStyleSheet("color: #607289; font-size: 10.5pt;")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
         row = QHBoxLayout()
         self.ars_combo = QComboBox(); self.refresh_ars()
         row.addWidget(QLabel("ARS:")); row.addWidget(self.ars_combo, 1)
@@ -4464,21 +4668,24 @@ class ARSManagerDialog(QDialog):
         form.addRow("Sala Emergencia:", box)
         layout.addLayout(form)
         row1 = QHBoxLayout()
-        self.btn_add = QPushButton("Agregar ARS")
+        self.btn_add = QPushButton("+ Agregar ARS")
         self.btn_del = QPushButton("Eliminar ARS")
-        self.btn_save = QPushButton("Guardar sala")
-        row1.addWidget(self.btn_add); row1.addWidget(self.btn_del); row1.addWidget(self.btn_save)
+        self.btn_save = QPushButton("Guardar cambios")
+        row1.addWidget(self.btn_add); row1.addWidget(self.btn_del); row1.addStretch(1); row1.addWidget(self.btn_save)
         layout.addLayout(row1)
-        row2 = QHBoxLayout()
-        self.btn_import_ars_word = QPushButton("Importar ARS (Word)")
-        self.btn_edit_labs = QPushButton("Editar Laboratorios")
-        self.btn_edit_imgs = QPushButton("Editar Imágenes")
-        self.btn_edit_procs = QPushButton("Editar Procedimientos")
-        self.btn_edit_hono = QPushButton("Editar Honorarios")
-        row2.addWidget(self.btn_import_ars_word); row2.addWidget(self.btn_edit_labs); row2.addWidget(self.btn_edit_imgs); row2.addWidget(self.btn_edit_procs); row2.addWidget(self.btn_edit_hono)
-        layout.addLayout(row2)
+        catalogs = QGroupBox("Catálogos y servicios")
+        row2 = QGridLayout(catalogs)
+        self.btn_import_ars_word = QPushButton("Importar catálogo desde Word")
+        self.btn_edit_labs = QPushButton("Laboratorios")
+        self.btn_edit_imgs = QPushButton("Imágenes")
+        self.btn_edit_procs = QPushButton("Procedimientos")
+        self.btn_edit_hono = QPushButton("Honorarios")
+        row2.addWidget(self.btn_edit_labs, 0, 0); row2.addWidget(self.btn_edit_imgs, 0, 1)
+        row2.addWidget(self.btn_edit_procs, 1, 0); row2.addWidget(self.btn_edit_hono, 1, 1)
+        row2.addWidget(self.btn_import_ars_word, 2, 0, 1, 2)
+        layout.addWidget(catalogs)
         if user_is_admin(self.current_user):
-            self.btn_toggle_migrate = QPushButton("🔄 Mostrar migración ARS")
+            self.btn_toggle_migrate = QPushButton("Mostrar migración entre ARS")
             set_button_role(self.btn_toggle_migrate, 'warning')
             layout.addWidget(self.btn_toggle_migrate)
             mig = QGroupBox("Migrar datos entre ARS")
@@ -6585,6 +6792,7 @@ class MainWindow(QMainWindow):
         self.catalog_font_size = 12 if screen_w >= 1800 else 11 if screen_w >= 1500 else 10
         self.catalog_left_width = 560 if screen_w >= 1800 else 500 if screen_w >= 1500 else 420
         self.catalog_tab_font_size = 10 if screen_w >= 1800 else 9 if screen_w >= 1500 else 8
+        self._responsive_mode = None
 
         username = self.current_user.get("username", "") if self.current_user else ""
         self.preferences = get_user_preferences(username)
@@ -6630,8 +6838,10 @@ class MainWindow(QMainWindow):
         title_wrap = QVBoxLayout()
         title = QLabel(APP_TITLE)
         title.setStyleSheet("font-size: 24pt; font-weight: 800;")
-        subtitle = QLabel("Hospital Provincial Dr. Ángel Contreras Mejía - Calculos medicamentos")
+        subtitle = QLabel("Hospital Provincial Dr. Ángel Contreras Mejía · Facturación de medicamentos y servicios médicos")
         subtitle.setStyleSheet("font-size: 11pt; font-weight: normal;")
+        self.header_title = title
+        self.header_subtitle = subtitle
         title_wrap.addWidget(title); title_wrap.addWidget(subtitle); header.addLayout(title_wrap, 1)
         
         top_right = QVBoxLayout()
@@ -6716,18 +6926,25 @@ class MainWindow(QMainWindow):
         content_lay.setContentsMargins(20, 15, 20, 10)
 
         billing_group = QGroupBox("Datos de Facturación")
-        billing_lay = QVBoxLayout(billing_group)
+        billing_lay = QGridLayout(billing_group)
+        billing_lay.setHorizontalSpacing(8)
+        billing_lay.setVerticalSpacing(8)
+        # Las etiquetas conservan solo su ancho natural; los campos reciben
+        # el espacio sobrante. Esto evita grandes vacíos en monitores anchos.
+        billing_lay.setColumnStretch(0, 0)
+        billing_lay.setColumnStretch(1, 5)
+        billing_lay.setColumnStretch(2, 0)
+        billing_lay.setColumnStretch(3, 0)
+        billing_lay.setColumnStretch(4, 0)
+        billing_lay.setColumnStretch(5, 1)
 
-        patient_row = QHBoxLayout()
         self.name_edit = QLineEdit(); self.name_edit.setPlaceholderText("Nombre del paciente")
         self.date_edit = QDateEdit(); self.date_edit.setCalendarPopup(True); self.date_edit.setDisplayFormat("yyyy-MM-dd"); self.date_edit.setDate(QDate.currentDate()); self.date_edit.setMinimumWidth(150)
         self.dx_edit = QLineEdit(); self.dx_edit.setPlaceholderText("Diagnóstico (DX)")
-        patient_row.addWidget(QLabel("Paciente:")); patient_row.addWidget(self.name_edit, 2)
-        patient_row.addWidget(QLabel("Fecha:")); patient_row.addWidget(self.date_edit)
-        patient_row.addWidget(QLabel("DX:")); patient_row.addWidget(self.dx_edit, 2)
-        billing_lay.addLayout(patient_row)
+        billing_lay.addWidget(QLabel("Paciente:"), 0, 0); billing_lay.addWidget(self.name_edit, 0, 1, 1, 3)
+        billing_lay.addWidget(QLabel("Fecha:"), 0, 4); billing_lay.addWidget(self.date_edit, 0, 5)
+        billing_lay.addWidget(QLabel("Diagnóstico:"), 1, 0); billing_lay.addWidget(self.dx_edit, 1, 1, 1, 3)
 
-        ars_row = QHBoxLayout()
         self.ars_combo = QComboBox(); self.ars_combo.addItems(ars_list()); self.ars_combo.setMaximumWidth(240)
         self.sala_spin = QDoubleSpinBox(); self.sala_spin.setRange(0, 1_000_000); self.sala_spin.setDecimals(2); self.sala_spin.setSingleStep(SALA_STEP)
         self.sala_spin.valueChanged.connect(lambda v: self.update_totals())
@@ -6737,21 +6954,22 @@ class MainWindow(QMainWindow):
         self.btn_ars_mgmt = QPushButton("Gestión ARS")
         self.btn_import_meds = QPushButton("Importar Word")
         
-        ars_row.addWidget(QLabel("ARS:")); ars_row.addWidget(self.ars_combo)
-        ars_row.addSpacing(15); ars_row.addWidget(QLabel("Sala Emergencia:")); ars_row.addWidget(self.sala_spin)
-        ars_row.addStretch(1)
-        ars_row.addWidget(self.btn_add_catalog_item)
-        ars_row.addWidget(self.btn_manage_catalog)
-        ars_row.addWidget(self.btn_ars_mgmt)
-        ars_row.addWidget(self.btn_import_meds)
-        billing_lay.addLayout(ars_row)
+        billing_lay.addWidget(QLabel("ARS:"), 1, 4); billing_lay.addWidget(self.ars_combo, 1, 5)
+        billing_lay.addWidget(QLabel("Sala de emergencia:"), 2, 0); billing_lay.addWidget(self.sala_spin, 2, 1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self.btn_add_catalog_item); actions.addWidget(self.btn_manage_catalog)
+        actions.addWidget(self.btn_ars_mgmt); actions.addWidget(self.btn_import_meds)
+        billing_lay.addLayout(actions, 2, 2, 1, 4)
         
         content_lay.addWidget(billing_group)
 
         main_split = QSplitter(Qt.Horizontal)
         left = QWidget(); left_v = QVBoxLayout(left); left_v.setContentsMargins(0, 10, 10, 0)
         middle = QWidget(); middle_v = QVBoxLayout(middle); middle_v.setContentsMargins(10, 10, 0, 0)
-        left.setMinimumWidth(min(self.catalog_left_width, 560))
+        left.setMinimumWidth(300)
+        middle.setMinimumWidth(390)
+        self.main_split = main_split
         main_split.addWidget(left); main_split.addWidget(middle)
         main_split.setChildrenCollapsible(False)
         main_split.setStretchFactor(0, 1) 
@@ -6768,7 +6986,7 @@ class MainWindow(QMainWindow):
         self.tabs.setElideMode(Qt.ElideNone)
         self.tabs.tabBar().setExpanding(False)
         self.tabs.setStyleSheet(f"QTabBar::tab {{ padding: 6px 8px; font-size: {self.catalog_tab_font_size}pt; }}")
-        compact_tab_labels = {
+        self.compact_tab_labels = {
             "Medicamentos": "💊 Med.",
             "Materiales": "📦 Mat.",
             "Laboratorios": "🩸 Lab.",
@@ -6782,7 +7000,7 @@ class MainWindow(QMainWindow):
             return lambda pos: self.show_catalog_context_menu(pos, cat_name)
 
         for cat in ALL_CATEGORIES:
-            tab_idx = self.tabs.addTab(self.source_lists[cat], compact_tab_labels.get(cat, f"{CAT_EMOJIS.get(cat, '')} {cat}"))
+            tab_idx = self.tabs.addTab(self.source_lists[cat], self.compact_tab_labels.get(cat, f"{CAT_EMOJIS.get(cat, '')} {cat}"))
             self.tabs.setTabToolTip(tab_idx, cat)
             self.source_lists[cat].setContextMenuPolicy(Qt.CustomContextMenu)
             self.source_lists[cat].customContextMenuRequested.connect(crear_callback_menu(cat))
@@ -6860,9 +7078,9 @@ class MainWindow(QMainWindow):
         
         cart_actions = QHBoxLayout()
         cart_actions.setContentsMargins(0, 5, 10, 5) 
-        self.lbl_sub_medicamentos = QLabel("Medicamentos: $0.00")
+        self.lbl_sub_medicamentos = QLabel("Medicamentos: RD$ 0.00")
         self.lbl_sub_medicamentos.setStyleSheet("font-size: 10pt; color: #555;")
-        self.lbl_sub_materiales = QLabel("Materiales: $0.00")
+        self.lbl_sub_materiales = QLabel("Materiales: RD$ 0.00")
         self.lbl_sub_materiales.setStyleSheet("font-size: 10pt; color: #555;")
         cart_actions.addWidget(self.lbl_sub_medicamentos)
         cart_actions.addSpacing(20)
@@ -6882,7 +7100,7 @@ class MainWindow(QMainWindow):
         self.lbl_edit_mode = QLabel("")
         self.lbl_edit_mode.setStyleSheet("color: #c62828; font-weight: bold; font-size: 12pt; border: none;")
         
-        self.lbl_total = QLabel("Total: $0.00")
+        self.lbl_total = QLabel("Total: RD$ 0.00")
         self.lbl_total.setObjectName("TotalLabel")
         
         self.btn_generate = QPushButton("🖨️ GENERAR RECIBO PDF (F5)")
@@ -6921,6 +7139,43 @@ class MainWindow(QMainWindow):
             widget.itemDoubleClicked.connect(lambda _item, c=cat: self.add_selected_item(category_override=c))
             
         self.cart_table.itemDoubleClicked.connect(self.remove_current_cart_selection)
+        QTimer.singleShot(0, self._update_responsive_ui)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "tabs"):
+            self._update_responsive_ui()
+
+    def _update_responsive_ui(self):
+        width = self.width()
+        mode = "wide" if width >= 1500 else "medium" if width >= 1100 else "compact"
+        if mode == self._responsive_mode:
+            return
+        self._responsive_mode = mode
+
+        for index, category in enumerate(ALL_CATEGORIES):
+            icon = CAT_EMOJIS.get(category, "")
+            if mode == "wide":
+                label = f"{icon} {category}"
+            elif mode == "medium":
+                label = self.compact_tab_labels.get(category, category)
+            else:
+                label = icon or category[:3]
+            self.tabs.setTabText(index, label)
+            self.tabs.setTabToolTip(index, category)
+
+        compact = mode == "compact"
+        self.lbl_modo_visual.setVisible(not compact)
+        self.header_subtitle.setVisible(not compact)
+        self.cart_table.setColumnHidden(3, compact)
+        self.btn_import_meds.setVisible(not compact)
+        self.btn_ars_mgmt.setText("ARS" if compact else "Gestión ARS")
+        self.btn_add_catalog_item.setText("+ Ítem" if compact else "Nuevo ítem")
+        self.btn_generate.setText("Generar PDF (F5)" if compact else "GENERAR RECIBO PDF (F5)")
+        self.btn_reset.setText("Limpiar" if compact else "Limpiar todo")
+        full_name = self.current_user.get("full_name", "Usuario")
+        role = self.current_user.get("role", "").capitalize()
+        self.lbl_user_top.setText(full_name if compact else f"{full_name} · {role}")
 
     def _setup_hotkeys(self):
         QShortcut(QKeySequence("F3"), self).activated.connect(self.focus_search)
@@ -7184,7 +7439,7 @@ class MainWindow(QMainWindow):
             if term_norm and term_norm not in remove_accents(name): continue
             effective_price = get_effective_price(category, price) if category else float(price)
             
-            display_text = f"  {name}   —   ${effective_price:,.2f}"
+            display_text = f"{name}    ·    RD$ {effective_price:,.2f}"
             it = QListWidgetItem(display_text)
             it.setData(Qt.UserRole, (name, effective_price))
             
@@ -7532,10 +7787,10 @@ class MainWindow(QMainWindow):
         
         total += self.sala_spin.value() if self.current_ars else 0.0
         
-        txt = f"Total: ${total:,.2f}"
+        txt = f"Total: RD$ {total:,.2f}"
         self.lbl_total.setText(txt)
-        self.lbl_sub_medicamentos.setText(f"Medicamentos: ${medicamentos_sub:,.2f}")
-        self.lbl_sub_materiales.setText(f"Materiales: ${materiales_sub:,.2f}")
+        self.lbl_sub_medicamentos.setText(f"Medicamentos: RD$ {medicamentos_sub:,.2f}")
+        self.lbl_sub_materiales.setText(f"Materiales: RD$ {materiales_sub:,.2f}")
 
     def reset_all(self):
         self.mark_activity()
@@ -7550,15 +7805,17 @@ class MainWindow(QMainWindow):
         self.editing_recibo_id = None
         self.editing_recibo_numero = None
         self.lbl_edit_mode.setText("")
-        self.btn_generate.setText("🖨️ GENERAR RECIBO PDF (F5)")
+        self.btn_generate.setText("GENERAR RECIBO PDF (F5)")
         self.btn_cancel_edit.hide()
         self.cart_table.setRowCount(0)
-        self.lbl_total.setText("Total: $0.00")
-        self.lbl_sub_medicamentos.setText("Medicamentos: $0.00")
-        self.lbl_sub_materiales.setText("Materiales: $0.00")
+        self.lbl_total.setText("Total: RD$ 0.00")
+        self.lbl_sub_medicamentos.setText("Medicamentos: RD$ 0.00")
+        self.lbl_sub_materiales.setText("Materiales: RD$ 0.00")
         self.name_edit.clear()
         self.dx_edit.clear()
         self.date_edit.setDate(QDate.currentDate())
+        self._responsive_mode = None
+        self._update_responsive_ui()
 
     def cancel_edit(self):
         self.reset_all()
