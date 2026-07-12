@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <style>{{ styles|safe }}</style>
+</head>
+<body>
+  <header class="institutional-header">
+    <div class="brand">
+      {% if logo_url %}<img src="{{ logo_url }}" alt="Logo del hospital">{% endif %}
+      <div>
+        <h1>HOSPITAL PROVINCIAL</h1>
+        <h2>DR. ÁNGEL CONTRERAS MEJÍA</h2>
+      </div>
+    </div>
+    <div class="report-badge">INFORME INSTITUCIONAL</div>
+  </header>
+
+  <section class="report-title">
+    <div>
+      <h3>{{ title }}</h3>
+      <p>{{ subtitle }}</p>
+    </div>
+    <div class="metadata">
+      <strong>Generado por:</strong> {{ generated_by }}<br>
+      <strong>Fecha:</strong> {{ generated_at }}
+    </div>
+  </section>
+
+  {% if mode == "panel" %}
+    {% set summary = data.summary %}
+    <section class="filter-summary">
+      <strong>Filtros:</strong>
+      ARS: {{ data.filters.ars }} · Facturador: {{ data.filters.user }} ·
+      Medicamento: {{ data.filters.medication }} · Categoría: {{ data.filters.category }}
+    </section>
+    <section class="kpi-grid three">
+      <article class="kpi blue"><span>Total de recibos</span><strong>{{ "{:,}".format(summary.receipts) }}</strong></article>
+      <article class="kpi green"><span>Total emitido</span><strong>RD$ {{ "{:,.2f}".format(summary.total) }}</strong></article>
+      <article class="kpi orange"><span>Promedio por recibo</span><strong>RD$ {{ "{:,.2f}".format(summary.average) }}</strong></article>
+    </section>
+
+    <section class="chart-grid">
+      <article class="chart-card"><h4>Distribución porcentual por categoría</h4>{{ donut_svg|safe }}</article>
+      <article class="chart-card"><h4>Distribución por categorías - Total emitido</h4>{{ category_bar_svg|safe }}</article>
+      {% if data.view.show_ars_comparison %}
+      <article class="chart-card">
+        <h4>Distribución porcentual por ARS</h4>
+        <p class="chart-subtitle">Porcentaje según: {{ data.view.ars_metric_label }}</p>
+        {{ comparison_svg|safe }}
+      </article>
+      {% endif %}
+      <article class="chart-card{% if not data.view.show_ars_comparison %} full{% endif %}">
+        <h4>Evolución diaria</h4>
+        <p class="chart-subtitle">Métrica: {{ data.view.evolution_label }}</p>
+        {{ line_svg|safe }}
+      </article>
+    </section>
+
+    {% if data.view.show_ars_comparison %}
+    <section class="table-card page-break-avoid">
+      <h4>Tabla resumen</h4>
+      <table>
+        <thead><tr><th>ARS</th><th>Total emitido</th><th>Recibos</th><th>% del dinero</th><th>% de recibos</th><th>Promedio / recibo</th></tr></thead>
+        <tbody>
+          {% for row in data.summary_table %}
+          <tr>
+            <td>{{ row.label }}</td><td>RD$ {{ "{:,.2f}".format(row.total) }}</td><td>{{ row.receipts }}</td>
+            <td>{{ "{:.1f}%".format(row.money_percentage * 100) }}</td>
+            <td>{{ "{:.1f}%".format(row.receipt_percentage * 100) }}</td>
+            <td>RD$ {{ "{:,.2f}".format(row.average) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    {% endif %}
+  {% else %}
+    <section class="kpi-grid three">
+      <article class="kpi blue"><span>Total de recibos</span><strong>{{ totals.get('_total_recibos', 0) }}</strong></article>
+      <article class="kpi green"><span>Total general emitido</span><strong>RD$ {{ "{:,.2f}".format(totals.get('Total General', 0)) }}</strong></article>
+      <article class="kpi orange"><span>Sala de emergencia</span><strong>RD$ {{ "{:,.2f}".format(totals.get('Sala Emergencia', 0)) }}</strong></article>
+    </section>
+    <section class="table-card">
+      <h4>Resumen de cargos</h4>
+      <table>
+        <thead><tr><th>Categoría</th><th>Total facturado</th><th>Participación</th></tr></thead>
+        <tbody>
+          {% set grand = totals.get('Total General', 0) %}
+          {% for category, amount in category_rows %}
+          <tr><td>{{ category }}</td><td>RD$ {{ "{:,.2f}".format(amount) }}</td><td>{{ "{:.1f}%".format((amount / grand * 100) if grand else 0) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="breakdown-grid">
+      <article class="table-card">
+        <h4>Desglose por ARS</h4>
+        <table><thead><tr><th>ARS</th><th>Recibos</th></tr></thead><tbody>
+          {% for label, count in ars_rows %}<tr><td>{{ label }}</td><td>{{ count }}</td></tr>{% endfor %}
+        </tbody></table>
+      </article>
+      <article class="table-card">
+        <h4>Desglose por auxiliar / usuario</h4>
+        <table><thead><tr><th>Usuario</th><th>Recibos</th></tr></thead><tbody>
+          {% for label, count in user_rows %}<tr><td>{{ label }}</td><td>{{ count }}</td></tr>{% endfor %}
+        </tbody></table>
+      </article>
+    </section>
+  {% endif %}
+
+  <footer class="report-footer">
+    <span>Criterio: fecha real de generación del recibo.</span>
+    <span>Documento para control y auditoría.</span>
+  </footer>
+</body>
+</html>
