@@ -6,6 +6,7 @@ import hmac
 import base64
 import csv
 import copy
+import shutil
 import hashlib
 import queue
 import threading
@@ -39,16 +40,17 @@ except ImportError:
     pool = None
 
 from PySide6.QtCore import Qt, QSize, QDate, QTimer, QObject, QEvent, Signal, Slot, QThread, QRectF, QPointF  # type: ignore
-from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QTextDocument, QTextCursor, QIcon  # type: ignore
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog  # type: ignore
+from PySide6.QtGui import QPixmap, QColor, QAction, QCursor, QKeySequence, QShortcut, QPainter, QBrush, QPen, QTextDocument, QTextCursor, QIcon, QPageLayout  # type: ignore
+from PySide6.QtPdf import QPdfDocument  # type: ignore
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog  # type: ignore
 from PySide6.QtWidgets import (  # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QComboBox, QPushButton, QTabWidget, QListWidget,
+    QLabel, QLineEdit, QComboBox, QPushButton, QTabWidget, QTabBar, QListWidget,
     QListWidgetItem, QSpinBox, QDoubleSpinBox, QGroupBox, QMessageBox,
     QSplitter, QFormLayout, QDialog, QDialogButtonBox, QToolButton, QStyle,
     QDateEdit, QAbstractSpinBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QCompleter, QMenu, QHeaderView, QSizePolicy, QInputDialog,
-    QGridLayout, QCheckBox, QScrollArea
+    QGridLayout, QCheckBox, QScrollArea, QToolTip, QRadioButton
 )
 
 from reportlab.pdfgen import canvas as rl_canvas  # type: ignore
@@ -68,7 +70,7 @@ from report_engine import PanelDataService, ReportHTMLRenderer, export_panel_xls
 
 
 APP_TITLE = "Sistema de Facturación Médica"
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 # En modo ejecutable PyInstaller, los recursos viven temporalmente en _MEI,
 # mientras que reportes, recibos y logs se guardan junto al ejecutable.
@@ -192,7 +194,8 @@ def get_stylesheet(is_dark=False):
     return f"""
     QMainWindow, QDialog {{ background-color: {bg}; color: {text}; }}
     QLabel {{ color: {text}; }}
-    QCheckBox {{ color: {text}; }}
+    QCheckBox, QRadioButton {{ color: {text}; }}
+    QRadioButton:disabled {{ color: {'#7F8C98' if is_dark else '#7A8794'}; }}
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {{
         background: {input_bg}; border: 1px solid {border}; border-radius: 6px; padding: 6px; color: {text};
     }}
@@ -230,6 +233,29 @@ def get_stylesheet(is_dark=False):
     QTabWidget::pane {{ border: 1px solid {border}; border-radius: 6px; background: {input_bg};}}
     QTabBar::tab {{ padding: 8px 12px; background: {alt_bg}; border: 1px solid {border}; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; color: {text};}}
     QTabBar::tab:selected {{ background: {input_bg}; font-weight: bold; color: {title_color};}}
+
+    QTabWidget#DashboardResultsTabs::pane {{
+        border: 1px solid {border}; border-radius: 7px; background: {input_bg};
+    }}
+    QTabWidget#DashboardResultsTabs QTabBar::tab {{
+        min-width: 115px; padding: 9px 14px; font-weight: 800;
+        background: {alt_bg}; color: {text}; border: 1px solid {border};
+        border-bottom: 2px solid {border};
+    }}
+    QTabWidget#DashboardResultsTabs QTabBar::tab:hover {{
+        background: {sel_bg}; color: {sel_text};
+    }}
+    QTabWidget#DashboardResultsTabs QTabBar::tab:selected {{
+        background: {input_bg}; color: {title_color};
+        border-bottom: 3px solid {title_color};
+    }}
+
+    QLabel#FilterDialogTitle {{ color: {title_color}; }}
+    QPushButton#FilterSecondaryButton {{
+        background: {alt_bg}; color: {text}; border: 1px solid {border};
+        border-radius: 6px; padding: 8px 12px; font-weight: 600;
+    }}
+    QPushButton#FilterSecondaryButton:hover {{ background: {sel_bg}; color: {sel_text}; }}
     
     QToolButton {{ border: 1px solid {border}; border-radius: 6px; background: {input_bg}; padding: 4px; color: {text}; }}
     QToolButton:hover {{ background: {alt_bg}; }}
@@ -347,6 +373,7 @@ CREATE TABLE IF NOT EXISTS recibos(
   fecha TEXT,
   dx TEXT,
   ars TEXT,
+  tipo_cobertura TEXT NOT NULL DEFAULT 'ASEGURADO',
   sala REAL NOT NULL DEFAULT 0,
   total REAL NOT NULL DEFAULT 0,
   pdf_filename TEXT,
@@ -544,6 +571,12 @@ def db_init():
             con.execute("ALTER TABLE recibos ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         if "deleted_at" not in recibos_cols:
             con.execute("ALTER TABLE recibos ADD COLUMN deleted_at TEXT")
+        if "tipo_cobertura" not in recibos_cols:
+            con.execute("ALTER TABLE recibos ADD COLUMN tipo_cobertura TEXT NOT NULL DEFAULT 'ASEGURADO'")
+            con.execute(
+                "UPDATE recibos SET tipo_cobertura=CASE WHEN COALESCE(ars, '')='' "
+                "THEN 'NO_ASEGURADO' ELSE 'ASEGURADO' END"
+            )
 
         con.execute(
             """UPDATE recibos r SET pdf_synced=1, pdf_sync_error=NULL
@@ -892,6 +925,7 @@ def save_receipt_with_items(
     is_backdated,
     created_at,
     grouped,
+    coverage="ASEGURADO",
 ):
     """Guarda cabecera, ítems e historial con un solo commit a PostgreSQL."""
     item_rows = []
@@ -914,12 +948,12 @@ def save_receipt_with_items(
         if editing:
             con.execute(
                 """UPDATE recibos
-                   SET nombre=%s, fecha=%s, dx=%s, ars=%s, sala=%s, total=%s,
+                   SET nombre=%s, fecha=%s, dx=%s, ars=%s, tipo_cobertura=%s, sala=%s, total=%s,
                        pdf_filename=%s, is_backdated=%s, pdf_synced=0,
                        pdf_sync_error=NULL
                    WHERE id=%s""",
                 (
-                    nombre or "", fecha or "", dx or "", ars or "",
+                    nombre or "", fecha or "", dx or "", ars or "", coverage,
                     float(sala), float(total), pdf_filename or "",
                     int(is_backdated), int(recibo_id),
                 ),
@@ -931,12 +965,12 @@ def save_receipt_with_items(
         else:
             cur = con.execute(
                 """INSERT INTO recibos(
-                       numero, nombre, fecha, dx, ars, sala, total, pdf_filename,
+                       numero, nombre, fecha, dx, ars, tipo_cobertura, sala, total, pdf_filename,
                        username, created_at, is_backdated, pdf_synced
-                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
+                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
                    RETURNING id""",
                 (
-                    int(numero), nombre or "", fecha or "", dx or "", ars or "",
+                    int(numero), nombre or "", fecha or "", dx or "", ars or "", coverage,
                     float(sala), float(total), pdf_filename or "", username or "",
                     created_at or now_str(), int(is_backdated),
                 ),
@@ -1004,7 +1038,39 @@ def list_receipts_history(limit: int = 500, offset: int = 0):
         return [dict(r) for r in cur.fetchall()]
 
 # ---> LÓGICA DE FILTRADO (ARS Y USUARIOS) <---
-def get_receipt_stats_between(start_date: str, end_date: str, is_backdated: int = 0, ars_filter: str = "Todas las ARS", user_filter: str = "Todos los Usuarios"):
+def _normalize_report_filter(value, empty_text):
+    if isinstance(value, dict):
+        mode = "exclude" if value.get("mode") in ("exclude", "excluir") else "include"
+        values = [str(item).strip() for item in value.get("values", []) if str(item).strip()]
+        return {"mode": mode, "values": values}
+    text = str(value or "").strip()
+    if not text or text == empty_text:
+        return {"mode": "include", "values": []}
+    return {"mode": "include", "values": [text]}
+
+
+def _report_filter_clause(column, selection):
+    values = selection.get("values", [])
+    if not values:
+        return "", None
+    if selection.get("mode") == "exclude":
+        return f" AND NOT (COALESCE({column}, '') = ANY(%s))", values
+    return f" AND {column} = ANY(%s)", values
+
+
+def _report_filter_text(selection, empty_text, label):
+    values = selection.get("values", [])
+    if not values:
+        return empty_text
+    action = "Excluir" if selection.get("mode") == "exclude" else "Incluir"
+    return f"{label} · {action}: {', '.join(values)}"
+
+
+def _report_filter_is_all(selection):
+    return not selection.get("values")
+
+
+def get_receipt_stats_between(start_date: str, end_date: str, is_backdated: int = 0, ars_filter="Todas las ARS", user_filter="Todos los Usuarios"):
     totals = {cat: 0.0 for cat in ALL_CATEGORIES}
 
     # Los reportes se calculan por la FECHA REAL DE CREACIÓN del recibo (created_at).
@@ -1049,19 +1115,16 @@ def get_receipt_stats_between(start_date: str, end_date: str, is_backdated: int 
             count_query_user += " AND r.is_backdated = %s"
             params.append(int(is_backdated))
 
-        if ars_filter != "Todas las ARS":
-            base_query_items += " AND r.ars = %s"
-            base_query_sala += " AND r.ars = %s"
-            count_query_ars += " AND r.ars = %s"
-            count_query_user += " AND r.ars = %s"
-            params.append(ars_filter)
-
-        if user_filter != "Todos los Usuarios":
-            base_query_items += " AND r.username = %s"
-            base_query_sala += " AND r.username = %s"
-            count_query_ars += " AND r.username = %s"
-            count_query_user += " AND r.username = %s"
-            params.append(user_filter)
+        ars_selection = _normalize_report_filter(ars_filter, "Todas las ARS")
+        user_selection = _normalize_report_filter(user_filter, "Todos los Usuarios")
+        for column, selection in (("r.ars", ars_selection), ("r.username", user_selection)):
+            clause, value = _report_filter_clause(column, selection)
+            if clause:
+                base_query_items += clause
+                base_query_sala += clause
+                count_query_ars += clause
+                count_query_user += clause
+                params.append(value)
 
         base_query_items += " GROUP BY ri.categoria"
         count_query_ars += " GROUP BY ars ORDER BY ars"
@@ -1094,10 +1157,15 @@ def get_receipt_stats_between(start_date: str, end_date: str, is_backdated: int 
         totals["_user_counts"] = user_counts
         totals["_total_recibos"] = total_recibos
         totals["_include_all_histories"] = bool(include_all_histories)
+        totals["_filters"] = {"ars": ars_selection, "users": user_selection}
+        totals["_filter_summary"] = (
+            f"{_report_filter_text(ars_selection, 'Todas las ARS', 'ARS')} · "
+            f"{_report_filter_text(user_selection, 'Todos los facturadores', 'Facturadores')}"
+        )
 
     return totals
 
-def get_receipt_stats_by_date(report_date: str, is_backdated: int = 0, ars_filter: str = "Todas las ARS", user_filter: str = "Todos los Usuarios"):
+def get_receipt_stats_by_date(report_date: str, is_backdated: int = 0, ars_filter="Todas las ARS", user_filter="Todos los Usuarios"):
     return get_receipt_stats_between(report_date, report_date, is_backdated, ars_filter, user_filter)
 
 
@@ -1227,6 +1295,10 @@ def get_dashboard_statistics(
     medication: str = "Todos los medicamentos",
     category: str = "Todas las categorías",
     trend_granularity: str = "day",
+    coverage: str = "Todas",
+    compare_previous: bool = False,
+    previous_start: str = "",
+    previous_end: str = "",
 ):
     return PanelDataService(db_connect).load(
         start_date=start_date,
@@ -1236,9 +1308,13 @@ def get_dashboard_statistics(
         medication=medication,
         category=category,
         trend_granularity=trend_granularity,
+        coverage=coverage,
+        compare_previous=compare_previous,
+        previous_start=previous_start,
+        previous_end=previous_end,
     )
 
-def list_receipts_for_report(start_date: str, end_date: str, is_backdated: int = 0, ars_filter: str = "Todas las ARS", user_filter: str = "Todos los Usuarios"):
+def list_receipts_for_report(start_date: str, end_date: str, is_backdated: int = 0, ars_filter="Todas las ARS", user_filter="Todos los Usuarios"):
     """Devuelve los recibos incluidos en un reporte usando la fecha real de generación (created_at).
 
     Mantiene ambas fechas:
@@ -1261,13 +1337,13 @@ def list_receipts_for_report(start_date: str, end_date: str, is_backdated: int =
         query += " AND r.is_backdated = %s"
         params.append(int(is_backdated))
 
-    if ars_filter != "Todas las ARS":
-        query += " AND r.ars = %s"
-        params.append(ars_filter)
-
-    if user_filter != "Todos los Usuarios":
-        query += " AND r.username = %s"
-        params.append(user_filter)
+    ars_selection = _normalize_report_filter(ars_filter, "Todas las ARS")
+    user_selection = _normalize_report_filter(user_filter, "Todos los Usuarios")
+    for column, selection in (("r.ars", ars_selection), ("r.username", user_selection)):
+        clause, value = _report_filter_clause(column, selection)
+        if clause:
+            query += clause
+            params.append(value)
 
     query += f" ORDER BY {created_date_expr}, r.numero"
 
@@ -1452,6 +1528,603 @@ def set_button_role(button: QPushButton, role: str):
         f"QPushButton:hover {{ background-color: {hover}; }}"
         f"QPushButton:disabled {{ background-color: #b0bec5; color: #757575; }}"
     )
+
+
+class NoWheelTabBar(QTabBar):
+    """Evita cambiar de sección accidentalmente con la rueda del mouse."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class MultiSelectFilter(QToolButton):
+    """Abre un diálogo transaccional: los cambios solo se guardan al aplicar."""
+
+    selectionChanged = Signal()
+
+    def __init__(self, values, empty_text="Todos", item_name="elemento", feminine=False, parent=None):
+        super().__init__(parent)
+        self.empty_text = empty_text
+        self.item_name = item_name
+        self.feminine = feminine
+        self._mode = "include"
+        self._values = [str(value) for value in values]
+        self._selected = set()
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setArrowType(Qt.DownArrow)
+        self.clicked.connect(self._open_dialog)
+        self._refresh_summary(emit=False)
+
+    def mode(self):
+        return self._mode
+
+    def set_mode(self, mode):
+        self._mode = "exclude" if mode in ("exclude", "excluir") else "include"
+        self._refresh_summary()
+
+    def filter_data(self):
+        return {"mode": self._mode, "values": self.selected_values()}
+
+    def selected_values(self):
+        return [value for value in self._values if value in self._selected]
+
+    def clear_selection(self):
+        self._selected.clear()
+        self._refresh_summary()
+
+    def select_all(self):
+        self._selected = set(self._values)
+        self._refresh_summary()
+
+    def _refresh_summary(self, emit=True):
+        values = self.selected_values()
+        if not values:
+            self.setText(self.empty_text)
+        else:
+            noun = self.item_name
+            if len(values) != 1 and noun != "ARS":
+                noun += "es" if noun.endswith("r") else "s"
+            suffix = (
+                ("excluida" if self.feminine else "excluido")
+                if self._mode == "exclude"
+                else ("incluida" if self.feminine else "incluido")
+            )
+            if len(values) != 1:
+                suffix += "s"
+            self.setText(f"{len(values)} {noun} {suffix}")
+        mode_text = "Excluir" if self._mode == "exclude" else "Incluir"
+        self.setToolTip(
+            f"{mode_text}: {', '.join(values)}" if values else self.empty_text
+        )
+        if emit:
+            self.selectionChanged.emit()
+
+    def _open_dialog(self):
+        dialog = QDialog(self)
+        dialog.setObjectName("MultiSelectFilterDialog")
+        dialog.setWindowTitle(f"Filtrar {self.item_name}")
+        dialog.setMinimumSize(500, 560)
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(11)
+
+        title = QLabel(f"Filtrar {self.item_name}")
+        title.setObjectName("FilterDialogTitle")
+        title.setStyleSheet("font-size: 16pt; font-weight: 900;")
+        root.addWidget(title)
+
+        root.addWidget(QLabel("Modo del filtro:"))
+        mode_row = QHBoxLayout()
+        include_radio = QRadioButton("Incluir seleccionadas")
+        exclude_radio = QRadioButton("Excluir seleccionadas")
+        include_radio.setChecked(self._mode == "include")
+        exclude_radio.setChecked(self._mode == "exclude")
+        mode_row.addWidget(include_radio)
+        mode_row.addWidget(exclude_radio)
+        mode_row.addStretch(1)
+        root.addLayout(mode_row)
+
+        search = QLineEdit()
+        search.setPlaceholderText(f"Buscar {self.item_name}...")
+        root.addWidget(search)
+
+        choices = QListWidget()
+        for value in self._values:
+            item = QListWidgetItem(value)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if value in self._selected else Qt.Unchecked)
+            choices.addItem(item)
+        root.addWidget(choices, 1)
+
+        def filter_choices(text):
+            term = (text or "").strip().casefold()
+            for index in range(choices.count()):
+                item = choices.item(index)
+                item.setHidden(bool(term and term not in item.text().casefold()))
+
+        def set_all(state):
+            for index in range(choices.count()):
+                choices.item(index).setCheckState(state)
+
+        search.textChanged.connect(filter_choices)
+
+        buttons = QHBoxLayout()
+        select_all = QPushButton("Seleccionar todas")
+        clear = QPushButton("Limpiar")
+        cancel = QPushButton("Cancelar")
+        apply_button = QPushButton("Aplicar filtro")
+        select_all.clicked.connect(lambda: set_all(Qt.Checked))
+        clear.clicked.connect(lambda: set_all(Qt.Unchecked))
+        cancel.clicked.connect(dialog.reject)
+        apply_button.clicked.connect(dialog.accept)
+        for secondary_button in (select_all, clear, cancel):
+            secondary_button.setObjectName("FilterSecondaryButton")
+        set_button_role(apply_button, "report")
+        buttons.addWidget(select_all)
+        buttons.addWidget(clear)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_button)
+        root.addLayout(buttons)
+
+        search.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._mode = "exclude" if exclude_radio.isChecked() else "include"
+        self._selected = {
+            choices.item(index).text()
+            for index in range(choices.count())
+            if choices.item(index).checkState() == Qt.Checked
+        }
+        self._refresh_summary()
+
+
+class MonthPickerButton(QToolButton):
+    monthChanged = Signal(int)
+    MONTHS = [
+        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    ]
+
+    def __init__(self, month=None, parent=None):
+        super().__init__(parent)
+        self._month = int(month or QDate.currentDate().month())
+        self.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self)
+        for index, label in enumerate(self.MONTHS, 1):
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, value=index: self.set_month(value))
+        self.setMenu(menu)
+        self._refresh_text()
+
+    def month(self):
+        return self._month
+
+    def set_month(self, month):
+        month = max(1, min(12, int(month)))
+        if month == self._month:
+            return
+        self._month = month
+        self._refresh_text()
+        self.monthChanged.emit(month)
+
+    def _refresh_text(self):
+        self.setText(self.MONTHS[self._month - 1])
+
+
+def resolve_period_range(
+    period_type,
+    year=None,
+    period_value=None,
+    custom_start=None,
+    custom_end=None,
+    anchor_date=None,
+):
+    """Resuelve un período calendario y su período anterior de forma única."""
+    period_type = str(period_type or "Mensual")
+    today = QDate.currentDate()
+    year = int(year or today.year())
+    anchor = anchor_date if isinstance(anchor_date, QDate) else today
+    start = end = None
+    number = None
+
+    if period_type == "Diario":
+        start = end = anchor
+        label = f"Día {anchor.toString('dd/MM/yyyy')}"
+        previous_start = previous_end = anchor.addDays(-1)
+        previous_label = previous_start.toString("dd/MM/yyyy")
+    elif period_type == "Semanal":
+        maximum_week = QDate(year, 12, 28).weekNumber()[0]
+        number = max(1, min(maximum_week, int(period_value or anchor.weekNumber()[0])))
+        first_week_monday = QDate(year, 1, 4)
+        first_week_monday = first_week_monday.addDays(-(first_week_monday.dayOfWeek() - 1))
+        start = first_week_monday.addDays((number - 1) * 7)
+        end = start.addDays(6)
+        label = f"Semana {number} de {year}"
+        previous_start, previous_end = start.addDays(-7), end.addDays(-7)
+        previous_week, previous_year = previous_start.weekNumber()
+        previous_label = f"Semana {previous_week} de {previous_year}"
+    elif period_type == "Mensual":
+        number = max(1, min(12, int(period_value or today.month())))
+        start = QDate(year, number, 1)
+        end = start.addMonths(1).addDays(-1)
+        label = f"{MonthPickerButton.MONTHS[number - 1]} de {year}"
+        previous_start, previous_end = start.addMonths(-1), start.addDays(-1)
+        previous_label = (
+            f"{MonthPickerButton.MONTHS[previous_start.month() - 1]} de {previous_start.year()}"
+        )
+    elif period_type == "Trimestral":
+        number = max(1, min(4, int(period_value or ((today.month() - 1) // 3 + 1))))
+        start = QDate(year, (number - 1) * 3 + 1, 1)
+        end = start.addMonths(3).addDays(-1)
+        names = ["Primer", "Segundo", "Tercer", "Cuarto"]
+        label = f"{names[number - 1]} trimestre de {year}"
+        previous_start, previous_end = start.addMonths(-3), start.addDays(-1)
+        previous_number = (previous_start.month() - 1) // 3 + 1
+        previous_label = f"{names[previous_number - 1]} trimestre de {previous_start.year()}"
+    elif period_type == "Semestral":
+        number = max(1, min(2, int(period_value or (1 if today.month() <= 6 else 2))))
+        start = QDate(year, 1 if number == 1 else 7, 1)
+        end = start.addMonths(6).addDays(-1)
+        names = ["Primer", "Segundo"]
+        label = f"{names[number - 1]} semestre de {year}"
+        previous_start, previous_end = start.addMonths(-6), start.addDays(-1)
+        previous_number = 1 if previous_start.month() == 1 else 2
+        previous_label = f"{names[previous_number - 1]} semestre de {previous_start.year()}"
+    elif period_type == "Anual":
+        start, end = QDate(year, 1, 1), QDate(year, 12, 31)
+        label = f"Año {year}"
+        previous_start, previous_end = QDate(year - 1, 1, 1), QDate(year - 1, 12, 31)
+        previous_label = f"Año {year - 1}"
+    else:
+        start = custom_start if isinstance(custom_start, QDate) else today
+        end = custom_end if isinstance(custom_end, QDate) else start
+        label = "Período personalizado"
+        previous_end = start.addDays(-1)
+        previous_start = previous_end.addDays(-start.daysTo(end))
+        previous_label = (
+            f"Período anterior del {previous_start.toString('dd/MM/yyyy')} "
+            f"al {previous_end.toString('dd/MM/yyyy')}"
+        )
+
+    return {
+        "period_type": period_type,
+        "period_year": year if period_type in (
+            "Semanal", "Mensual", "Trimestral", "Semestral", "Anual"
+        ) else start.year(),
+        "period_number": number,
+        "period_label": label,
+        "start_date": start.toString("yyyy-MM-dd"),
+        "end_date": end.toString("yyyy-MM-dd"),
+        "comparison_label": previous_label,
+        "comparison_start": previous_start.toString("yyyy-MM-dd"),
+        "comparison_end": previous_end.toString("yyyy-MM-dd"),
+    }
+
+
+class PeriodSelectorWidget(QWidget):
+    """Selector reutilizable para panel, reportes y comparaciones."""
+
+    periodChanged = Signal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._updating = False
+        self._layout_mode = None
+        self.layout_grid = QGridLayout(self)
+        self.layout_grid.setContentsMargins(0, 0, 0, 0)
+        self.layout_grid.setHorizontalSpacing(12)
+        self.layout_grid.setVerticalSpacing(7)
+
+        self.period_type = QComboBox()
+        self.period_type.addItems(
+            ["Diario", "Semanal", "Mensual", "Trimestral", "Semestral", "Anual", "Personalizado"]
+        )
+        self.period_type.setCurrentText("Mensual")
+        self.year = QSpinBox()
+        self.year.setRange(2000, 2100)
+        self.year.setValue(QDate.currentDate().year())
+        self.month = QComboBox()
+        self.month.addItems(MonthPickerButton.MONTHS)
+        self.month.setCurrentIndex(QDate.currentDate().month() - 1)
+        self.week = QComboBox()
+        self.quarter = QComboBox()
+        self.quarter.addItems([
+            "Primer trimestre - enero a marzo",
+            "Segundo trimestre - abril a junio",
+            "Tercer trimestre - julio a septiembre",
+            "Cuarto trimestre - octubre a diciembre",
+        ])
+        self.quarter.setCurrentIndex((QDate.currentDate().month() - 1) // 3)
+        self.semester = QComboBox()
+        self.semester.addItems([
+            "Primer semestre - enero a junio",
+            "Segundo semestre - julio a diciembre",
+        ])
+        self.semester.setCurrentIndex(0 if QDate.currentDate().month() <= 6 else 1)
+        self._refresh_week_options()
+        for combo in (self.period_type, self.week, self.month, self.quarter, self.semester):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+        self.anchor_date = QDateEdit(QDate.currentDate())
+        self.custom_from = QDateEdit(QDate.currentDate())
+        self.custom_to = QDateEdit(QDate.currentDate())
+        for field in (self.anchor_date, self.custom_from, self.custom_to):
+            field.setCalendarPopup(True)
+            field.setDisplayFormat("dd/MM/yyyy")
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet(
+            "background: #F3F7FC; color: #36516E; border-radius: 7px; "
+            "padding: 8px 11px; font-weight: 700;"
+        )
+        self._fields = [
+            (QLabel("Tipo de período:"), self.period_type),
+            (QLabel("Semana:"), self.week),
+            (QLabel("Mes:"), self.month),
+            (QLabel("Trimestre:"), self.quarter),
+            (QLabel("Semestre:"), self.semester),
+            (QLabel("Año:"), self.year),
+            (QLabel("Fecha de referencia:"), self.anchor_date),
+            (QLabel("Desde:"), self.custom_from),
+            (QLabel("Hasta:"), self.custom_to),
+        ]
+        for _label, field in self._fields:
+            field.setMinimumWidth(150)
+            field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.period_type.currentTextChanged.connect(self._changed)
+        self.year.valueChanged.connect(self._year_changed)
+        self.week.currentIndexChanged.connect(self._changed)
+        self.month.currentIndexChanged.connect(self._changed)
+        self.quarter.currentIndexChanged.connect(self._changed)
+        self.semester.currentIndexChanged.connect(self._changed)
+        self.anchor_date.dateChanged.connect(self._changed)
+        self.custom_from.dateChanged.connect(self._changed)
+        self.custom_to.dateChanged.connect(self._changed)
+        self._changed()
+
+    def definition(self):
+        period_type = self.period_type.currentText()
+        value = None
+        if period_type == "Mensual":
+            value = self.month.currentIndex() + 1
+        elif period_type == "Semanal":
+            value = self.week.currentData() or self.week.currentIndex() + 1
+        elif period_type == "Trimestral":
+            value = self.quarter.currentIndex() + 1
+        elif period_type == "Semestral":
+            value = self.semester.currentIndex() + 1
+        return resolve_period_range(
+            period_type,
+            year=self.year.value(),
+            period_value=value,
+            custom_start=self.custom_from.date(),
+            custom_end=self.custom_to.date(),
+            anchor_date=self.anchor_date.date(),
+        )
+
+    def _changed(self, *_args):
+        if self._updating:
+            return
+        period_type = self.period_type.currentText()
+        visible_widgets = {self.period_type}
+        if period_type == "Diario":
+            visible_widgets.add(self.anchor_date)
+        elif period_type == "Semanal":
+            visible_widgets.update((self.week, self.year))
+        elif period_type == "Mensual":
+            visible_widgets.update((self.year, self.month))
+        elif period_type == "Trimestral":
+            visible_widgets.update((self.year, self.quarter))
+        elif period_type == "Semestral":
+            visible_widgets.update((self.year, self.semester))
+        elif period_type == "Anual":
+            visible_widgets.add(self.year)
+        else:
+            visible_widgets.update((self.custom_from, self.custom_to))
+
+        visible_fields = [(label, field) for label, field in self._fields if field in visible_widgets]
+        self._visible_fields = visible_fields
+        self._arrange_fields()
+        definition = self.definition()
+        display_start = QDate.fromString(definition["start_date"], "yyyy-MM-dd").toString("dd/MM/yyyy")
+        display_end = QDate.fromString(definition["end_date"], "yyyy-MM-dd").toString("dd/MM/yyyy")
+        self.summary.setText(
+            f"{definition['period_label']}   ·   "
+            f"Fechas aplicadas: {display_start} al {display_end}"
+        )
+        self.periodChanged.emit(definition)
+
+    def _year_changed(self, *_args):
+        self._refresh_week_options()
+        self._changed()
+
+    def _refresh_week_options(self):
+        year = self.year.value()
+        previous_week = self.week.currentData() if self.week.count() else None
+        current_date = QDate.currentDate()
+        preferred = (
+            current_date.weekNumber()[0] if year == current_date.weekNumber()[1]
+            else int(previous_week or 1)
+        )
+        maximum_week = QDate(year, 12, 28).weekNumber()[0]
+        first_monday = QDate(year, 1, 4)
+        first_monday = first_monday.addDays(-(first_monday.dayOfWeek() - 1))
+        self.week.blockSignals(True)
+        self.week.clear()
+        for week_number in range(1, maximum_week + 1):
+            start = first_monday.addDays((week_number - 1) * 7)
+            end = start.addDays(6)
+            start_month = MonthPickerButton.MONTHS[start.month() - 1].lower()
+            end_month = MonthPickerButton.MONTHS[end.month() - 1].lower()
+            if start.month() == end.month():
+                dates = f"{start.day()} al {end.day()} de {end_month}"
+            else:
+                dates = f"{start.day()} de {start_month} al {end.day()} de {end_month}"
+            self.week.addItem(f"Semana {week_number} - {dates}", week_number)
+        self.week.setCurrentIndex(max(0, min(maximum_week, preferred) - 1))
+        self.week.blockSignals(False)
+
+    def _arrange_fields(self):
+        visible_fields = getattr(self, "_visible_fields", [])
+        for label, field in self._fields:
+            self.layout_grid.removeWidget(label)
+            self.layout_grid.removeWidget(field)
+            visible = any(field is current for _text, current in visible_fields)
+            label.setVisible(visible)
+            field.setVisible(visible)
+        self.layout_grid.removeWidget(self.summary)
+        for column in range(4):
+            self.layout_grid.setColumnStretch(column, 0)
+
+        width = self.width()
+        if width < 480:
+            mode = "stacked"
+        elif width < 700 and len(visible_fields) == 3:
+            mode = "two_rows"
+        else:
+            mode = "horizontal"
+        self._layout_mode = mode
+
+        if mode == "stacked":
+            row = 0
+            for label, field in visible_fields:
+                self.layout_grid.addWidget(label, row, 0)
+                self.layout_grid.addWidget(field, row + 1, 0)
+                row += 2
+            summary_row, summary_span = row, 1
+            self.layout_grid.setColumnStretch(0, 1)
+        elif mode == "two_rows":
+            for column, (label, field) in enumerate(visible_fields[:2]):
+                self.layout_grid.addWidget(label, 0, column)
+                self.layout_grid.addWidget(field, 1, column)
+                self.layout_grid.setColumnStretch(column, 1)
+            label, field = visible_fields[2]
+            self.layout_grid.addWidget(label, 2, 0, 1, 2)
+            self.layout_grid.addWidget(field, 3, 0, 1, 2)
+            summary_row, summary_span = 4, 2
+        else:
+            for column, (label, field) in enumerate(visible_fields):
+                self.layout_grid.addWidget(label, 0, column)
+                self.layout_grid.addWidget(field, 1, column)
+                self.layout_grid.setColumnStretch(column, 1)
+            summary_row, summary_span = 2, max(1, len(visible_fields))
+        self.layout_grid.addWidget(self.summary, summary_row, 0, 1, summary_span)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        previous_mode = self._layout_mode
+        width = event.size().width()
+        new_mode = "stacked" if width < 480 else (
+            "two_rows" if width < 700 and len(getattr(self, "_visible_fields", [])) == 3
+            else "horizontal"
+        )
+        if new_mode != previous_mode:
+            self._arrange_fields()
+
+
+class ComparisonPdfDialog(QDialog):
+    """Vista previa, guardado e impresión del PDF comparativo ya generado."""
+
+    def __init__(self, pdf_path, parent=None, dialog_title="Reporte comparativo listo", detail_text=None):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+        self.setWindowTitle("Vista previa de la comparación")
+        self.setMinimumWidth(620)
+        root = QVBoxLayout(self)
+        title = QLabel(dialog_title)
+        title.setStyleSheet("font-size: 16pt; font-weight: 900; color: #123F83;")
+        detail = QLabel(detail_text or (
+            "El documento se generó con la misma información que está visible en el panel. "
+            "Revísalo antes de imprimir o guarda una copia en otra ubicación."
+        ))
+        detail.setWordWrap(True)
+        detail.setStyleSheet(
+            "background: #F3F7FC; color: #36516E; padding: 12px; border-radius: 8px;"
+        )
+        filename = QLabel(os.path.basename(pdf_path))
+        filename.setWordWrap(True)
+        filename.setStyleSheet("font-weight: 800; color: #31475F; padding: 6px 2px;")
+        root.addWidget(title)
+        root.addWidget(detail)
+        root.addWidget(filename)
+        buttons = QHBoxLayout()
+        preview = QPushButton("Vista previa")
+        save = QPushButton("Guardar PDF")
+        print_button = QPushButton("Imprimir")
+        close = QPushButton("Cerrar")
+        set_button_role(preview, "report")
+        set_button_role(save, "success")
+        set_button_role(print_button, "report")
+        set_button_role(close, "neutral")
+        buttons.addWidget(preview)
+        buttons.addWidget(save)
+        buttons.addWidget(print_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        root.addLayout(buttons)
+        preview.clicked.connect(self.open_preview)
+        save.clicked.connect(self.save_copy)
+        print_button.clicked.connect(self.print_pdf)
+        close.clicked.connect(self.accept)
+
+    def _printer(self):
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageOrientation(QPageLayout.Landscape)
+        return printer
+
+    def _paint_pdf(self, printer):
+        document = QPdfDocument(self)
+        document.load(self.pdf_path)
+        if document.pageCount() <= 0:
+            return
+        painter = QPainter(printer)
+        try:
+            for page_index in range(document.pageCount()):
+                if page_index:
+                    printer.newPage()
+                page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+                page_size = QSize(int(page_rect.width()), int(page_rect.height()))
+                target = QSize(page_size)
+                target.scale(QSize(2400, 2400), Qt.KeepAspectRatio)
+                image = document.render(page_index, target)
+                scaled = image.size().scaled(page_size, Qt.KeepAspectRatio)
+                x = page_rect.x() + (page_rect.width() - scaled.width()) // 2
+                y = page_rect.y() + (page_rect.height() - scaled.height()) // 2
+                painter.drawImage(QRectF(x, y, scaled.width(), scaled.height()), image)
+        finally:
+            painter.end()
+
+    def open_preview(self):
+        printer = self._printer()
+        dialog = QPrintPreviewDialog(printer, self)
+        dialog.setWindowTitle("Vista previa - Reporte comparativo")
+        dialog.resize(1100, 760)
+        dialog.paintRequested.connect(self._paint_pdf)
+        dialog.exec()
+
+    def print_pdf(self):
+        printer = self._printer()
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._paint_pdf(printer)
+
+    def save_copy(self):
+        default_name = os.path.basename(self.pdf_path)
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Guardar reporte comparativo", default_name, "PDF (*.pdf)"
+        )
+        if not destination:
+            return
+        if not destination.lower().endswith(".pdf"):
+            destination += ".pdf"
+        try:
+            shutil.copy2(self.pdf_path, destination)
+            FloatingToast("Copia del reporte guardada", self).show()
+        except Exception as exc:
+            QMessageBox.critical(self, "Guardar PDF", f"No se pudo guardar la copia:\n{exc}")
 
 def _clean_name(s: str):
     s = (s or '').strip()
@@ -1857,6 +2530,8 @@ class ModernLineChart(QWidget):
         super().__init__(parent)
         self.entries = []
         self.currency = True
+        self._hover_points = []
+        self.setMouseTracking(True)
         self.setMinimumHeight(250)
 
     def set_entries(self, entries, currency=True):
@@ -1872,7 +2547,7 @@ class ModernLineChart(QWidget):
             painter.setPen(QColor("#77869A"))
             painter.drawText(self.rect(), Qt.AlignCenter, "No hay datos para mostrar")
             return
-        left, top, right, bottom = 58, 28, 20, 50
+        left, top, right, bottom = 84, 28, 20, 50
         width = max(1, self.width() - left - right)
         height = max(1, self.height() - top - bottom)
         maximum = max(value for _, value in self.entries) or 1
@@ -1880,27 +2555,108 @@ class ModernLineChart(QWidget):
         for line in range(5):
             y = top + height * line / 4
             painter.drawLine(left, int(y), left + width, int(y))
+            scale_value = maximum * (4 - line) / 4
+            shown = (
+                f"RD$ {scale_value / 1_000_000:.1f}M" if self.currency and scale_value >= 1_000_000
+                else f"RD$ {scale_value / 1_000:.0f}K" if self.currency and scale_value >= 1_000
+                else f"RD$ {scale_value:,.0f}" if self.currency
+                else f"{int(scale_value):,}"
+            )
+            painter.setPen(QColor("#687B91"))
+            font = painter.font(); font.setPointSize(7); painter.setFont(font)
+            painter.drawText(QRectF(2, y - 9, left - 10, 18), Qt.AlignRight | Qt.AlignVCenter, shown)
+            painter.setPen(QPen(QColor("#DFE8F3"), 1))
         divisor = max(1, len(self.entries) - 1)
         points = []
         for index, (_label, value) in enumerate(self.entries):
             x = left + width * index / divisor
             y = top + height - height * value / maximum
             points.append(QPointF(x, y))
+        self._hover_points = [
+            (point, label, value) for point, (label, value) in zip(points, self.entries)
+        ]
         painter.setPen(QPen(QColor("#F28C28"), 3))
         for first, second in zip(points, points[1:]):
             painter.drawLine(first, second)
-        label_step = max(1, (len(points) + 7) // 8)
+        value_step = max(1, (len(points) + 7) // 8)
+        date_step = 1 if len(points) <= 31 else value_step
         for index, (point, (label, value)) in enumerate(zip(points, self.entries)):
             painter.setBrush(QColor("#FFFFFF"))
             painter.setPen(QPen(QColor("#174A96"), 3))
             painter.drawEllipse(point, 4, 4)
-            if index % label_step == 0 or index == len(points) - 1:
+            if index % date_step == 0 or index == len(points) - 1:
                 painter.setPen(QColor("#52657A"))
                 font = painter.font(); font.setPointSize(8); painter.setFont(font)
-                painter.drawText(QRectF(point.x() - 45, top + height + 10, 90, 25), Qt.AlignHCenter | Qt.AlignTop, label[:13])
+                date_label = label[-2:] if len(points) <= 31 and len(label) >= 10 else label[:13]
+                painter.drawText(QRectF(point.x() - 22, top + height + 10, 44, 25), Qt.AlignHCenter | Qt.AlignTop, date_label)
+            if index % value_step == 0 or index == len(points) - 1:
+                painter.setPen(QColor("#52657A"))
+                font = painter.font(); font.setPointSize(8); painter.setFont(font)
                 shown = f"RD$ {value:,.0f}" if self.currency else f"{int(value):,}"
                 font.setBold(True); painter.setFont(font)
                 painter.drawText(QRectF(point.x() - 55, max(0, point.y() - 28), 110, 20), Qt.AlignCenter, shown)
+
+    def mouseMoveEvent(self, event):
+        if not self._hover_points:
+            return super().mouseMoveEvent(event)
+        point, label, value = min(
+            self._hover_points, key=lambda item: abs(item[0].x() - event.position().x())
+        )
+        if abs(point.x() - event.position().x()) <= 14:
+            shown = f"RD$ {value:,.2f}" if self.currency else f"{int(value):,}"
+            QToolTip.showText(event.globalPosition().toPoint(), f"{label}\n{shown}", self)
+        else:
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+
+class HorizontalBarChart(QWidget):
+    """Barras horizontales legibles incluso con muchas ARS."""
+
+    def __init__(self, accent="#174A96", parent=None):
+        super().__init__(parent)
+        self.entries = []
+        self.accent = QColor(accent)
+        self.percent = True
+        self.setMinimumHeight(245)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_entries(self, entries, percent=True):
+        self.entries = [(str(label), float(value or 0)) for label, value in entries]
+        self.percent = bool(percent)
+        self.setMinimumHeight(max(245, 52 + len(self.entries) * 31))
+        self.updateGeometry()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#FFFFFF"))
+        if not self.entries or max((value for _, value in self.entries), default=0) <= 0:
+            painter.setPen(QColor("#77869A"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No hay datos para los filtros seleccionados")
+            return
+        label_width, right, top = min(190, max(120, self.width() // 4)), 70, 18
+        chart_left = label_width + 18
+        chart_width = max(1, self.width() - chart_left - right)
+        maximum = max(value for _, value in self.entries) or 1
+        row_height = max(25, min(34, (self.height() - top * 2) / len(self.entries)))
+        font = painter.font(); font.setPointSize(8); painter.setFont(font)
+        for index, (label, value) in enumerate(self.entries):
+            y = top + index * row_height
+            painter.setPen(QColor("#334A62"))
+            painter.drawText(QRectF(6, y, label_width, row_height - 5), Qt.AlignRight | Qt.AlignVCenter, label)
+            track = QRectF(chart_left, y + 5, chart_width, max(10, row_height - 15))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#E8EEF6"))
+            painter.drawRoundedRect(track, 5, 5)
+            fill = QRectF(track.x(), track.y(), track.width() * value / maximum, track.height())
+            painter.setBrush(self.accent)
+            painter.drawRoundedRect(fill, 5, 5)
+            painter.setPen(QColor("#23344A"))
+            font.setBold(True); painter.setFont(font)
+            value_text = f"{value:.1f}%" if self.percent else f"{value:,.0f}"
+            painter.drawText(QRectF(chart_left + chart_width + 8, y, right - 12, row_height - 5), Qt.AlignLeft | Qt.AlignVCenter, value_text)
 
 
 class DonutChart(QWidget):
@@ -2542,6 +3298,7 @@ class PDFDatabaseWorker(threading.Thread):
         self.date_str = job["date_str"]
         self.dx_raw = job["dx_raw"]
         self.ars_name = job["ars_name"]
+        self.coverage = job.get("coverage", "ASEGURADO")
         self.sala = job["sala"]
         self.grouped = job["grouped"]
         self.total_general = job["total_general"]
@@ -2636,7 +3393,7 @@ class PDFDatabaseWorker(threading.Thread):
                     "fecha": self.date_str,
                     "paciente": self.patient,
                     "diagnostico": self.dx_raw or "N/A",
-                    "ars": self.ars_name or "N/A",
+                    "ars": self.ars_name or ("NO ASEGURADO" if self.coverage == "NO_ASEGURADO" else "N/A"),
                     "sala": float(self.sala or 0),
                     "categorias": categorias_pdf_html,
                     "total_general": float(self.total_general or 0),
@@ -2720,6 +3477,7 @@ class PDFDatabaseWorker(threading.Thread):
                 self.is_backdated,
                 generated_at,
                 self.grouped,
+                self.coverage,
             )
             database_elapsed = perf_counter() - database_started
             visible_elapsed = perf_counter() - total_started
@@ -3555,20 +4313,29 @@ def _create_report_pdf(filename: str, title: str, date_subtitle: str, totals: di
 
 
 # ---> FUNCIONES PDF PARA REPORTES CON FILTRO ARS/USUARIO <---
-def generate_daily_report_pdf(report_date: str, generated_by: str, is_backdated: int = 0, ars_filter: str = "Todas las ARS", user_filter: str = "Todos los Usuarios") -> str:
+def _report_filters_title(ars_filter, user_filter):
+    ars_selection = _normalize_report_filter(ars_filter, "Todas las ARS")
+    user_selection = _normalize_report_filter(user_filter, "Todos los Usuarios")
+    parts = []
+    if ars_selection["values"]:
+        action = "excluidas" if ars_selection["mode"] == "exclude" else "incluidas"
+        parts.append(f"ARS {action}: {', '.join(ars_selection['values'])}")
+    if user_selection["values"]:
+        action = "excluidos" if user_selection["mode"] == "exclude" else "incluidos"
+        parts.append(f"Facturadores {action}: {', '.join(user_selection['values'])}")
+    return " · ".join(parts), ars_selection, user_selection
+
+
+def generate_daily_report_pdf(report_date: str, generated_by: str, is_backdated: int = 0, ars_filter="Todas las ARS", user_filter="Todos los Usuarios") -> str:
     include_all_histories = is_backdated is None or str(is_backdated) == "-1"
     totals = get_receipt_stats_by_date(report_date, is_backdated, ars_filter, user_filter)
     tipo = "PRINCIPAL + ALTERNO" if include_all_histories else ("ALTERNO" if int(is_backdated) == 1 else "PRINCIPAL")
     tipo_file = "ambos_historiales" if include_all_histories else tipo.lower()
 
-    ars_tag = f"_{ars_filter.replace(' ', '_')}" if ars_filter != "Todas las ARS" else ""
-    usr_tag = f"_{user_filter.replace(' ', '_')}" if user_filter != "Todos los Usuarios" else ""
-
+    _filter_title, ars_selection, user_selection = _report_filters_title(ars_filter, user_filter)
     title_extra = ""
-    if ars_filter != "Todas las ARS": title_extra += f" - {ars_filter}"
-    if user_filter != "Todos los Usuarios": title_extra += f" - {user_filter}"
 
-    filename = f"reporte_diario_{tipo_file}{ars_tag}{usr_tag}_{report_date}.pdf".replace(" ", "_")
+    filename = f"reporte_diario_{tipo_file}_{report_date}.pdf"
     path = _create_report_pdf(
         filename,
         f"REPORTE DIARIO ({tipo}){title_extra}",
@@ -3577,7 +4344,8 @@ def generate_daily_report_pdf(report_date: str, generated_by: str, is_backdated:
         generated_by
     )
 
-    if not include_all_histories and int(is_backdated) == 0 and ars_filter == "Todas las ARS" and user_filter == "Todos los Usuarios":
+    if (not include_all_histories and int(is_backdated) == 0
+            and _report_filter_is_all(ars_selection) and _report_filter_is_all(user_selection)):
         save_daily_report_record(report_date, path, totals, generated_by)
     else:
         full_type = f"Diario ({tipo.title()}){title_extra}"
@@ -3585,20 +4353,30 @@ def generate_daily_report_pdf(report_date: str, generated_by: str, is_backdated:
 
     return path
 
-def generate_period_report_pdf(report_type: str, start_date: str, end_date: str, generated_by: str, is_backdated: int = 0, ars_filter: str = "Todas las ARS", user_filter: str = "Todos los Usuarios") -> str:
+def generate_period_report_pdf(
+    report_type: str,
+    start_date: str,
+    end_date: str,
+    generated_by: str,
+    is_backdated: int = 0,
+    ars_filter="Todas las ARS",
+    user_filter="Todos los Usuarios",
+    period_metadata: dict | None = None,
+) -> str:
     include_all_histories = is_backdated is None or str(is_backdated) == "-1"
     totals = get_receipt_stats_between(start_date, end_date, is_backdated, ars_filter, user_filter)
     tipo = "PRINCIPAL + ALTERNO" if include_all_histories else ("ALTERNO" if int(is_backdated) == 1 else "PRINCIPAL")
     tipo_file = "ambos_historiales" if include_all_histories else tipo.lower()
 
-    ars_tag = f"_{ars_filter.replace(' ', '_')}" if ars_filter != "Todas las ARS" else ""
-    usr_tag = f"_{user_filter.replace(' ', '_')}" if user_filter != "Todos los Usuarios" else ""
-
+    _filter_title, _ars_selection, _user_selection = _report_filters_title(
+        ars_filter, user_filter
+    )
     title_extra = ""
-    if ars_filter != "Todas las ARS": title_extra += f" - {ars_filter}"
-    if user_filter != "Todos los Usuarios": title_extra += f" - {user_filter}"
 
-    filename = f"reporte_{report_type.lower()}_{tipo_file}{ars_tag}{usr_tag}_{start_date}_al_{end_date}.pdf".replace(" ", "_")
+    if period_metadata:
+        totals["_period"] = copy.deepcopy(period_metadata)
+    safe_report_type = re.sub(r"[^a-zA-Z0-9_-]+", "_", report_type).strip("_") or "periodo"
+    filename = f"reporte_{safe_report_type.lower()}_{tipo_file}_{start_date}_al_{end_date}.pdf"
     path = _create_report_pdf(
         filename,
         f"REPORTE {report_type.upper()} ({tipo}){title_extra}",
@@ -3609,6 +4387,60 @@ def generate_period_report_pdf(report_type: str, start_date: str, end_date: str,
 
     full_type = f"{report_type} ({tipo.title()}){title_extra}"
     save_report_history(full_type, start_date, end_date, path, totals, generated_by)
+    return path
+
+
+def generate_comparison_report_pdf(data: dict, generated_by: str) -> str:
+    """Genera el comparativo desde la copia exacta ya cargada en el panel."""
+    snapshot = copy.deepcopy(data or {})
+    if not snapshot.get("filters", {}).get("compare_previous"):
+        raise ValueError("La comparación no está activada.")
+    if not snapshot.get("previous", {}).get("receipts"):
+        raise ValueError("No existen datos válidos en el período anterior.")
+    period = snapshot.get("period", {})
+    current_label = period.get("period_label", "Período actual")
+    previous_label = period.get("comparison_label", "Período anterior")
+    start_date = snapshot.get("start_date", period.get("start_date", ""))
+    end_date = snapshot.get("end_date", period.get("end_date", ""))
+    filename = (
+        f"Comparacion_{start_date}_al_{end_date}_vs_"
+        f"{snapshot.get('previous_start', '')}_al_{snapshot.get('previous_end', '')}.pdf"
+    )
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = os.path.join(REPORTS_DIR, filename)
+    context = {
+        "mode": "comparison",
+        "title": "REPORTE COMPARATIVO",
+        "subtitle": f"{current_label} frente a {previous_label}",
+        "generated_by": generated_by,
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "logo_path": LOGO_PATH or "",
+        "data": snapshot,
+    }
+    ReportHTMLRenderer().render_pdf(context, path, landscape=True)
+    with open(path, "rb") as pdf_file:
+        pdf_bytes = pdf_file.read()
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO pdf_storage(filename, file_data) VALUES(%s, %s) "
+            "ON CONFLICT(filename) DO UPDATE SET file_data=EXCLUDED.file_data",
+            (filename, psycopg2.Binary(pdf_bytes)),
+        )
+    history_payload = {
+        "period": period,
+        "filters": snapshot.get("filters", {}),
+        "summary": snapshot.get("summary", {}),
+        "previous": snapshot.get("previous", {}),
+        "category_comparison": snapshot.get("category_comparison", []),
+    }
+    save_report_history(
+        f"Reporte comparativo: {current_label} vs {previous_label}",
+        start_date,
+        end_date,
+        path,
+        history_payload,
+        generated_by,
+    )
     return path
 
 def safe_generate_pending_reports(username: str):
@@ -5590,7 +6422,6 @@ class LegacyReportsDialog(QDialog):
         set_button_role(self.btn_delete, 'danger')
         set_button_role(self.btn_close, 'neutral')
 
-        self.sync_dates_for_type(self.report_type.currentText())
         self.load_rows()
 
     def _on_date_from_changed(self, new_date):
@@ -5883,7 +6714,6 @@ class ReportsDialog(LegacyReportsDialog):
         self._build_generation_tab()
         self._build_history_tab()
 
-        self.sync_dates_for_type(self.report_type.currentText())
         self.load_rows()
         if self.panel_access:
             self.update_dashboard_period(refresh=False)
@@ -5909,58 +6739,140 @@ class ReportsDialog(LegacyReportsDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         content = QWidget()
+        content.setMinimumWidth(0)
+        content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(content)
         layout.setSpacing(13)
 
-        filters_box = QGroupBox("Filtros del panel")
-        filters = QGridLayout(filters_box)
-        self.dashboard_period = QComboBox()
-        self.dashboard_period.addItems(
-            ["Este año", "Últimos 12 meses", "Mes actual", "Año anterior", "Período personalizado"]
+        self._updating_dashboard_dates = False
+
+        self.dashboard_period_box = QGroupBox("1. Seleccione el período")
+        self.dashboard_period_layout = QGridLayout(self.dashboard_period_box)
+        self.dashboard_period_selector = PeriodSelectorWidget()
+        self.dashboard_period_layout.addWidget(self.dashboard_period_selector, 0, 0)
+        self.dashboard_period_fields = []
+
+        self.dashboard_main_box = QGroupBox("2. ¿Qué información desea analizar?")
+        self.dashboard_main_layout = QGridLayout(self.dashboard_main_box)
+        self.dashboard_ars = MultiSelectFilter(
+            ars_list(), "Todas las ARS", "ARS", feminine=True
         )
-        self.dashboard_from = QDateEdit(QDate.currentDate())
-        self.dashboard_to = QDateEdit(QDate.currentDate())
-        for field in (self.dashboard_from, self.dashboard_to):
-            field.setCalendarPopup(True)
-            field.setDisplayFormat("dd/MM/yyyy")
-        self.dashboard_ars = QComboBox()
-        self.dashboard_ars.addItem("Todas las ARS")
-        self.dashboard_ars.addItems(ars_list())
-        self.dashboard_user = QComboBox()
-        self.dashboard_user.addItem("Todos los Usuarios")
-        self.dashboard_user.addItems(list_usernames())
-        self.dashboard_medication = QComboBox()
-        self.dashboard_medication.addItem("Todos los medicamentos")
-        self.dashboard_medication.addItems(sorted(get_universal("Medicamentos").keys()))
+        self.dashboard_user = MultiSelectFilter(
+            list_usernames(), "Todos los facturadores", "facturador"
+        )
+        self.dashboard_coverage = QComboBox()
+        self.dashboard_coverage.addItems(["Todas", "Asegurados", "No asegurados"])
+        self.dashboard_main_fields = [
+            (QLabel("ARS:"), self.dashboard_ars),
+            (QLabel("Facturadores:"), self.dashboard_user),
+            (QLabel("Cobertura:"), self.dashboard_coverage),
+        ]
+        self.btn_dashboard_advanced = QToolButton()
+        self.btn_dashboard_advanced.setCheckable(True)
+        self.btn_dashboard_advanced.setText("▸ Más filtros")
+        self.btn_dashboard_advanced.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_dashboard_advanced.setMaximumWidth(250)
+        self.btn_dashboard_advanced.setStyleSheet(
+            "QToolButton { color: #123F83; border: none; background: transparent; "
+            "font-weight: 800; padding: 6px 2px; text-align: left; } "
+            "QToolButton:hover { color: #0B7A5A; }"
+        )
+
+        self.dashboard_advanced_box = QGroupBox("Filtros adicionales")
+        self.dashboard_advanced_layout = QGridLayout(self.dashboard_advanced_box)
         self.dashboard_category = QComboBox()
         self.dashboard_category.addItem("Todas las categorías")
-        self.dashboard_category.addItems(ALL_CATEGORIES)
+        self.dashboard_category.addItems(ALL_CATEGORIES + ["Sala de Emergencia"])
+        self.dashboard_granularity = QComboBox()
+        self.dashboard_granularity.addItems(["Automático", "Diario", "Semanal", "Mensual"])
+        self.dashboard_advanced_fields = [
+            (QLabel("Categoría de servicio:"), self.dashboard_category),
+            (QLabel("Mostrar evolución por:"), self.dashboard_granularity),
+        ]
+        self.dashboard_advanced_box.setVisible(False)
+
+        self.btn_dashboard_compare = QPushButton("Comparar período actual")
+        self.btn_dashboard_compare.setCheckable(True)
         self.btn_dashboard_refresh = QPushButton("Actualizar panel")
-        self.btn_dashboard_clear = QPushButton("Limpiar filtros")
-        self.btn_export_excel = QPushButton("Exportar a Excel")
-        self.btn_export_panel_pdf = QPushButton("Exportar a PDF")
+        self.btn_dashboard_clear = QPushButton("Restablecer filtros")
+        self.btn_export_excel = QPushButton("Exportar Excel")
+        self.btn_export_panel_pdf = QPushButton("Exportar panel PDF")
+        self.btn_dashboard_export = QToolButton()
+        self.btn_dashboard_export.setText("Exportar")
+        self.btn_dashboard_export.setPopupMode(QToolButton.InstantPopup)
+        export_menu = QMenu(self.btn_dashboard_export)
+        export_excel_action = export_menu.addAction("Exportar a Excel")
+        export_pdf_action = export_menu.addAction("Exportar panel a PDF")
+        export_excel_action.triggered.connect(self.export_dashboard_excel)
+        export_pdf_action.triggered.connect(self.export_dashboard_pdf)
+        self.btn_dashboard_export.setMenu(export_menu)
+        self.btn_dashboard_export.setStyleSheet(
+            "QToolButton { background: #2E7D32; color: white; border: none; border-radius: 6px; "
+            "padding: 8px 14px; font-weight: 800; } "
+            "QToolButton:hover { background: #1F6424; } "
+            "QToolButton:disabled { background: #B0BEC5; color: #757575; }"
+        )
+        self.btn_print_comparison = QPushButton("Imprimir comparación")
+        self.btn_print_comparison.setEnabled(False)
+        self.dashboard_compare_summary = QLabel()
+        self.dashboard_compare_summary.setWordWrap(True)
+        self.dashboard_compare_summary.setStyleSheet(
+            "color: #36516E; background: transparent; border: none; padding: 4px 2px;"
+        )
+        self.dashboard_compare_summary.setVisible(False)
+        self.dashboard_action_query_label = QLabel("CONSULTA")
+        self.dashboard_action_docs_label = QLabel("DOCUMENTOS")
+        for label in (self.dashboard_action_query_label, self.dashboard_action_docs_label):
+            label.setStyleSheet(
+                "color: #66788A; background: transparent; border: none; "
+                "font-size: 8pt; font-weight: 900; letter-spacing: .5px; padding: 2px;"
+            )
         set_button_role(self.btn_dashboard_refresh, "report")
+        set_button_role(self.btn_dashboard_compare, "neutral")
         set_button_role(self.btn_dashboard_clear, "neutral")
         set_button_role(self.btn_export_excel, "success")
         set_button_role(self.btn_export_panel_pdf, "report")
+        set_button_role(self.btn_print_comparison, "report")
+        self.btn_dashboard_clear.setMaximumWidth(180)
+        self.btn_dashboard_clear.setStyleSheet(
+            "QPushButton { background: #FFF3E0; color: #8A4B08; border: 1px solid #E7B36D; "
+            "border-radius: 6px; padding: 8px 12px; font-weight: 800; } "
+            "QPushButton:hover { background: #FFE2B8; border-color: #D99538; } "
+            "QPushButton:pressed { background: #F8CE92; }"
+        )
+        self.btn_dashboard_clear.setCursor(Qt.PointingHandCursor)
+        for button in (self.btn_dashboard_refresh, self.btn_dashboard_compare,
+                       self.btn_export_excel, self.btn_export_panel_pdf,
+                       self.btn_print_comparison):
+            button.setMinimumHeight(38)
+        self.btn_dashboard_export.setMinimumHeight(38)
 
-        self.dashboard_filters_layout = filters
-        self.dashboard_filter_fields = [
-            (QLabel("Período:"), self.dashboard_period),
-            (QLabel("Desde:"), self.dashboard_from),
-            (QLabel("Hasta:"), self.dashboard_to),
-            (QLabel("ARS:"), self.dashboard_ars),
-            (QLabel("Facturador:"), self.dashboard_user),
-            (QLabel("Medicamento:"), self.dashboard_medication),
-            (QLabel("Categoría:"), self.dashboard_category),
-        ]
+        self.dashboard_filter_fields = self.dashboard_main_fields + self.dashboard_advanced_fields
         self.dashboard_filter_buttons = [
-            self.btn_dashboard_refresh, self.btn_dashboard_clear,
-            self.btn_export_excel, self.btn_export_panel_pdf,
+            self.btn_dashboard_refresh, self.btn_dashboard_compare, self.btn_dashboard_clear,
+            self.btn_print_comparison, self.btn_dashboard_export,
         ]
+        self.dashboard_actions_widget = QWidget()
+        self.dashboard_actions_widget.setStyleSheet(
+            "QWidget { background: #FFFFFF; border: 1px solid #D7E2F0; border-radius: 9px; } "
+            "QPushButton { border-radius: 6px; }"
+        )
+        dashboard_actions = QGridLayout(self.dashboard_actions_widget)
+        self.dashboard_actions_layout = dashboard_actions
+        dashboard_actions.setContentsMargins(10, 8, 10, 9)
+        dashboard_actions.setSpacing(8)
+        for _label, field in self.dashboard_filter_fields:
+            field.setMinimumWidth(120)
+            field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if isinstance(field, QComboBox):
+                field.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                field.setMinimumContentsLength(12)
         self._arrange_dashboard_filters(False)
-        layout.addWidget(filters_box)
+        layout.addWidget(self.dashboard_period_box)
+        layout.addWidget(self.dashboard_main_box)
+        layout.addWidget(self.dashboard_advanced_box)
 
         self.dashboard_filter_summary = QLabel()
         self.dashboard_filter_summary.setWordWrap(True)
@@ -5969,6 +6881,7 @@ class ReportsDialog(LegacyReportsDialog):
             "border-radius: 9px; padding: 9px 13px; font-weight: 700;"
         )
         layout.addWidget(self.dashboard_filter_summary)
+        layout.addWidget(self.dashboard_actions_widget)
 
         self.dashboard_status = QLabel("Preparando estadísticas...")
         self.dashboard_status.setStyleSheet(
@@ -5976,25 +6889,113 @@ class ReportsDialog(LegacyReportsDialog):
         )
         layout.addWidget(self.dashboard_status)
 
+        self.dashboard_results_state = QLabel(
+            "Cargando la información del período seleccionado..."
+        )
+        self.dashboard_results_state.setWordWrap(True)
+        self.dashboard_results_state.setStyleSheet(
+            "background: #EDF4FD; color: #24415F; border: 1px solid #C4D7EF; "
+            "border-radius: 8px; padding: 11px 13px; font-weight: 700;"
+        )
+        layout.addWidget(self.dashboard_results_state)
+
+        self.dashboard_results_tabs = QTabWidget()
+        self.dashboard_results_tabs.setTabBar(NoWheelTabBar(self.dashboard_results_tabs))
+        self.dashboard_results_tabs.setObjectName("DashboardResultsTabs")
+        self.dashboard_results_tabs.setDocumentMode(True)
+        self.dashboard_results_tabs.setMinimumHeight(560)
+        self.dashboard_results_tabs.setMinimumWidth(0)
+        self.dashboard_results_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.dashboard_summary_page = QWidget()
+        self.dashboard_distribution_page = QWidget()
+        self.dashboard_evolution_page = QWidget()
+        self.dashboard_comparison_page = QWidget()
+        self.dashboard_detail_page = QWidget()
+        for page in (
+            self.dashboard_summary_page, self.dashboard_distribution_page,
+            self.dashboard_evolution_page, self.dashboard_comparison_page,
+            self.dashboard_detail_page,
+        ):
+            page.setMinimumWidth(0)
+            page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.dashboard_summary_layout = QVBoxLayout(self.dashboard_summary_page)
+        self.dashboard_distribution_layout = QVBoxLayout(self.dashboard_distribution_page)
+        self.dashboard_evolution_layout = QVBoxLayout(self.dashboard_evolution_page)
+        self.dashboard_comparison_page_layout = QVBoxLayout(self.dashboard_comparison_page)
+        self.dashboard_detail_layout = QVBoxLayout(self.dashboard_detail_page)
+        self.dashboard_summary_tab_index = self.dashboard_results_tabs.addTab(
+            self.dashboard_summary_page, "Resumen"
+        )
+        self.dashboard_distribution_tab_index = self.dashboard_results_tabs.addTab(
+            self.dashboard_distribution_page, "Distribuciones"
+        )
+        self.dashboard_evolution_tab_index = self.dashboard_results_tabs.addTab(
+            self.dashboard_evolution_page, "Evolución"
+        )
+        self.dashboard_comparison_tab_index = self.dashboard_results_tabs.addTab(
+            self.dashboard_comparison_page, "Comparación"
+        )
+        self.dashboard_detail_tab_index = self.dashboard_results_tabs.addTab(
+            self.dashboard_detail_page, "Detalle"
+        )
+        self.dashboard_results_tabs.setTabVisible(self.dashboard_comparison_tab_index, False)
+        layout.addWidget(self.dashboard_results_tabs)
+
         kpis = QGridLayout()
         self.dashboard_kpi_layout = kpis
         self.kpi_receipts = self._create_kpi_card(kpis, 0, "TOTAL DE RECIBOS", "0", "#123F83")
         self.kpi_total = self._create_kpi_card(kpis, 1, "TOTAL EMITIDO", "RD$ 0.00", "#0B7A5A")
         self.kpi_average = self._create_kpi_card(kpis, 2, "PROMEDIO POR RECIBO", "RD$ 0.00", "#D16619")
+        self.kpi_room = self._create_kpi_card(kpis, 3, "SALA DE EMERGENCIA", "RD$ 0.00", "#6B35C8")
         self.dashboard_kpi_cards = [
             self.kpi_receipts._card_widget,
             self.kpi_total._card_widget,
             self.kpi_average._card_widget,
+            self.kpi_room._card_widget,
         ]
-        layout.addLayout(kpis)
+        self.dashboard_summary_layout.addLayout(kpis)
 
-        self.comparison_label = QLabel()
-        self.comparison_label.setWordWrap(True)
-        self.comparison_label.setStyleSheet(
+        self.dashboard_comparison_panel = QGroupBox("Comparación con período anterior")
+        comparison_panel_layout = QVBoxLayout(self.dashboard_comparison_panel)
+        self.dashboard_comparison_periods = QLabel()
+        self.dashboard_comparison_periods.setWordWrap(True)
+        self.dashboard_comparison_periods.setStyleSheet(
             "background: #EDF4FD; color: #24415F; border: 1px solid #C4D7EF; "
-            "border-radius: 9px; padding: 11px 14px; font-weight: 700;"
+            "border-radius: 7px; padding: 9px 12px; font-weight: 700;"
         )
-        layout.addWidget(self.comparison_label)
+        comparison_panel_layout.addWidget(self.dashboard_comparison_periods)
+
+        self.dashboard_comparison_table = QTableWidget(0, 5)
+        self.dashboard_comparison_table.setHorizontalHeaderLabels(
+            ["Indicador", "Actual", "Anterior", "Diferencia", "Variación"]
+        )
+        self.dashboard_comparison_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, 5):
+            self.dashboard_comparison_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeToContents
+            )
+        self.dashboard_comparison_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboard_comparison_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.dashboard_comparison_table.setAlternatingRowColors(True)
+        self.dashboard_comparison_table.setMinimumHeight(190)
+        comparison_panel_layout.addWidget(self.dashboard_comparison_table)
+
+        categories_comparison_box = QGroupBox("Comparación por categorías")
+        self.dashboard_categories_comparison_box = categories_comparison_box
+        categories_comparison_layout = QVBoxLayout(categories_comparison_box)
+        self.dashboard_categories_comparison = QTableWidget(0, 2)
+        self.dashboard_categories_comparison.setHorizontalHeaderLabels(["Categoría", "Variación"])
+        self.dashboard_categories_comparison.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.dashboard_categories_comparison.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.dashboard_categories_comparison.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboard_categories_comparison.setSelectionMode(QAbstractItemView.NoSelection)
+        self.dashboard_categories_comparison.setAlternatingRowColors(True)
+        self.dashboard_categories_comparison.setMinimumHeight(210)
+        categories_comparison_layout.addWidget(self.dashboard_categories_comparison)
+        comparison_panel_layout.addWidget(categories_comparison_box)
+        self.dashboard_comparison_panel.setVisible(False)
+        self.dashboard_comparison_page_layout.addWidget(self.dashboard_comparison_panel)
+        self.dashboard_comparison_page_layout.addStretch(1)
 
         charts = QGridLayout()
         charts.setHorizontalSpacing(13)
@@ -6004,12 +7005,20 @@ class ReportsDialog(LegacyReportsDialog):
         donut_box = QGroupBox("Distribución porcentual por categoría")
         self.donut_box = donut_box
         donut_layout = QVBoxLayout(donut_box)
+        donut_hint = QLabel("Participación de cada categoría sobre el total clasificado, incluida Sala de Emergencia.")
+        donut_hint.setWordWrap(True)
+        donut_hint.setStyleSheet("color: #66788A; font-size: 8.5pt;")
+        donut_layout.addWidget(donut_hint)
         self.donut_chart = DonutChart()
         donut_layout.addWidget(self.donut_chart)
 
         category_box = QGroupBox("Distribución por categorías - Total emitido")
         self.category_box = category_box
         category_layout = QVBoxLayout(category_box)
+        category_hint = QLabel("Monto acumulado por categoría, expresado en pesos dominicanos (RD$).")
+        category_hint.setStyleSheet("color: #66788A; font-size: 8.5pt;")
+        category_hint.setWordWrap(True)
+        category_layout.addWidget(category_hint)
         self.category_bar_chart = ModernBarChart("#0B7A5A")
         category_layout.addWidget(self.category_bar_chart)
 
@@ -6024,12 +7033,16 @@ class ReportsDialog(LegacyReportsDialog):
         comparison_controls.addWidget(QLabel("Porcentaje según:"))
         comparison_controls.addWidget(self.dashboard_comparison_metric, 1)
         comparison_layout.addLayout(comparison_controls)
-        self.comparison_chart = ModernBarChart("#174A96")
+        self.comparison_chart = HorizontalBarChart("#174A96")
         comparison_layout.addWidget(self.comparison_chart)
 
         line_box = QGroupBox("Evolución diaria")
         self.line_box = line_box
         line_layout = QVBoxLayout(line_box)
+        line_hint = QLabel("Cada punto representa el intervalo seleccionado; coloca el cursor para consultar el valor exacto.")
+        line_hint.setWordWrap(True)
+        line_hint.setStyleSheet("color: #66788A; font-size: 8.5pt;")
+        line_layout.addWidget(line_hint)
         evolution_controls = QHBoxLayout()
         self.dashboard_evolution_metric = QComboBox()
         self.dashboard_evolution_metric.addItems(
@@ -6041,14 +7054,25 @@ class ReportsDialog(LegacyReportsDialog):
         self.line_chart = ModernLineChart()
         line_layout.addWidget(self.line_chart)
 
-        self._dashboard_chart_widgets = [donut_box, category_box, comparison_box, line_box]
+        coverage_box = QGroupBox("Distribución por tipo de cobertura")
+        self.coverage_box = coverage_box
+        coverage_layout = QVBoxLayout(coverage_box)
+        coverage_hint = QLabel("Porcentaje de recibos asegurados y no asegurados dentro del período.")
+        coverage_hint.setWordWrap(True)
+        coverage_hint.setStyleSheet("color: #66788A; font-size: 8.5pt;")
+        coverage_layout.addWidget(coverage_hint)
+        self.coverage_chart = HorizontalBarChart("#0B7A5A")
+        coverage_layout.addWidget(self.coverage_chart)
+
+        self._dashboard_chart_widgets = [donut_box, category_box, comparison_box, coverage_box]
         charts.addWidget(donut_box, 0, 0)
         charts.addWidget(category_box, 0, 1)
-        charts.addWidget(comparison_box, 1, 0)
-        charts.addWidget(line_box, 1, 1)
+        charts.addWidget(comparison_box, 1, 0, 1, 2)
+        charts.addWidget(coverage_box, 2, 0, 1, 2)
         charts.setColumnStretch(0, 1)
         charts.setColumnStretch(1, 1)
-        layout.addLayout(charts)
+        self.dashboard_distribution_layout.addLayout(charts)
+        self.dashboard_evolution_layout.addWidget(line_box)
 
         table_box = QGroupBox("Tabla resumen de los datos mostrados")
         self.dashboard_table_box = table_box
@@ -6062,7 +7086,7 @@ class ReportsDialog(LegacyReportsDialog):
         self.dashboard_table.setAlternatingRowColors(True)
         self.dashboard_table.setMinimumHeight(220)
         table_layout.addWidget(self.dashboard_table)
-        layout.addWidget(table_box)
+        self.dashboard_detail_layout.addWidget(table_box)
 
         guide_box = QGroupBox("Lectura guiada de los resultados")
         guide_layout = QVBoxLayout(guide_box)
@@ -6073,26 +7097,30 @@ class ReportsDialog(LegacyReportsDialog):
             "border-radius: 8px; padding: 13px;"
         )
         guide_layout.addWidget(self.dashboard_guide)
-        layout.addWidget(guide_box)
+        self.dashboard_summary_layout.addWidget(guide_box)
+        self.dashboard_summary_layout.addStretch(1)
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
         self.tabs.addTab(tab, "Panel y gráficos")
 
-        self.dashboard_period.currentTextChanged.connect(self.update_dashboard_period)
+        self.dashboard_period_selector.periodChanged.connect(self.update_dashboard_period)
         for combo in (
-            self.dashboard_ars, self.dashboard_user,
-            self.dashboard_medication, self.dashboard_category,
+            self.dashboard_coverage, self.dashboard_category, self.dashboard_granularity,
         ):
             combo.currentTextChanged.connect(self._mark_dashboard_stale)
-        self.dashboard_from.dateChanged.connect(self._mark_dashboard_stale)
-        self.dashboard_to.dateChanged.connect(self._mark_dashboard_stale)
+        self.dashboard_ars.selectionChanged.connect(self._mark_dashboard_stale)
+        self.dashboard_user.selectionChanged.connect(self._mark_dashboard_stale)
+        self.btn_dashboard_compare.toggled.connect(self._dashboard_compare_toggled)
+        self.btn_dashboard_advanced.toggled.connect(self._toggle_dashboard_advanced)
         self.dashboard_comparison_metric.currentTextChanged.connect(self.render_dashboard)
         self.dashboard_evolution_metric.currentTextChanged.connect(self.render_dashboard)
         self.btn_dashboard_refresh.clicked.connect(self.refresh_dashboard)
         self.btn_dashboard_clear.clicked.connect(self.clear_dashboard_filters)
         self.btn_export_excel.clicked.connect(self.export_dashboard_excel)
         self.btn_export_panel_pdf.clicked.connect(self.export_dashboard_pdf)
+        self.btn_print_comparison.clicked.connect(self.print_dashboard_comparison)
+        self.update_dashboard_period(refresh=False)
 
     def _create_kpi_card(self, grid, column, title, initial, color):
         card = QWidget()
@@ -6114,36 +7142,70 @@ class ReportsDialog(LegacyReportsDialog):
         return value_label
 
     def _arrange_dashboard_filters(self, compact):
-        layout = self.dashboard_filters_layout
-        for label, field in self.dashboard_filter_fields:
-            layout.removeWidget(label)
-            layout.removeWidget(field)
         for button in self.dashboard_filter_buttons:
-            layout.removeWidget(button)
-        for column in range(6):
-            layout.setColumnStretch(column, 0)
-            layout.setColumnMinimumWidth(column, 0)
+            self.dashboard_actions_layout.removeWidget(button)
+        self.dashboard_actions_layout.removeWidget(self.dashboard_compare_summary)
+        self.dashboard_actions_layout.removeWidget(self.dashboard_action_query_label)
+        self.dashboard_actions_layout.removeWidget(self.dashboard_action_docs_label)
+        for column in range(7):
+            self.dashboard_actions_layout.setColumnStretch(column, 0)
         if compact:
-            layout.setColumnStretch(1, 1)
-            for row, (label, field) in enumerate(self.dashboard_filter_fields):
-                layout.addWidget(label, row, 0)
-                layout.addWidget(field, row, 1)
-            button_row = len(self.dashboard_filter_fields)
-            layout.addWidget(self.btn_dashboard_refresh, button_row, 0, 1, 2)
-            layout.addWidget(self.btn_dashboard_clear, button_row + 1, 0, 1, 2)
-            layout.addWidget(self.btn_export_excel, button_row + 2, 0, 1, 2)
-            layout.addWidget(self.btn_export_panel_pdf, button_row + 3, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.dashboard_action_query_label, 0, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_refresh, 1, 0)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_compare, 1, 1)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_clear, 2, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.dashboard_action_docs_label, 3, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.btn_print_comparison, 4, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_export, 5, 0, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.dashboard_compare_summary, 6, 0, 1, 2)
+            self.dashboard_actions_layout.setColumnStretch(0, 1)
+            self.dashboard_actions_layout.setColumnStretch(1, 1)
         else:
-            for column in (1, 3, 5):
-                layout.setColumnStretch(column, 1)
-            positions = [(0, 0), (0, 2), (0, 4), (1, 0), (1, 2), (1, 4), (2, 0)]
-            for (label, field), (row, column) in zip(self.dashboard_filter_fields, positions):
-                layout.addWidget(label, row, column)
-                layout.addWidget(field, row, column + 1)
-            layout.addWidget(self.btn_dashboard_refresh, 2, 2)
-            layout.addWidget(self.btn_dashboard_clear, 2, 3)
-            layout.addWidget(self.btn_export_excel, 2, 4)
-            layout.addWidget(self.btn_export_panel_pdf, 2, 5)
+            self.dashboard_actions_layout.addWidget(self.dashboard_action_query_label, 0, 0, 1, 3)
+            self.dashboard_actions_layout.addWidget(self.dashboard_action_docs_label, 0, 4, 1, 3)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_refresh, 1, 0)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_compare, 1, 1)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_clear, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.btn_print_comparison, 1, 4)
+            self.dashboard_actions_layout.addWidget(self.btn_dashboard_export, 1, 5, 1, 2)
+            self.dashboard_actions_layout.addWidget(self.dashboard_compare_summary, 2, 0, 1, 7)
+            self.dashboard_actions_layout.setColumnStretch(3, 1)
+
+        def clear_fields(target_layout, fields):
+            for label, field in fields:
+                target_layout.removeWidget(label)
+                target_layout.removeWidget(field)
+
+        clear_fields(self.dashboard_main_layout, self.dashboard_main_fields)
+        clear_fields(self.dashboard_advanced_layout, self.dashboard_advanced_fields)
+        self.dashboard_main_layout.removeWidget(self.btn_dashboard_advanced)
+
+        if compact:
+            for row, (label, field) in enumerate(self.dashboard_main_fields):
+                self.dashboard_main_layout.addWidget(label, row, 0)
+                self.dashboard_main_layout.addWidget(field, row, 1)
+            self.dashboard_main_layout.addWidget(
+                self.btn_dashboard_advanced, len(self.dashboard_main_fields), 0, 1, 2, Qt.AlignLeft
+            )
+            self.dashboard_main_layout.setColumnStretch(1, 1)
+
+            for row, (label, field) in enumerate(self.dashboard_advanced_fields):
+                self.dashboard_advanced_layout.addWidget(label, row, 0)
+                self.dashboard_advanced_layout.addWidget(field, row, 1)
+            self.dashboard_advanced_layout.setColumnStretch(1, 1)
+        else:
+            for column, (label, field) in enumerate(self.dashboard_main_fields):
+                self.dashboard_main_layout.addWidget(label, 0, column)
+                self.dashboard_main_layout.addWidget(field, 1, column)
+                self.dashboard_main_layout.setColumnStretch(column, 1)
+            self.dashboard_main_layout.addWidget(
+                self.btn_dashboard_advanced, 2, 0, 1, 3, Qt.AlignLeft
+            )
+
+            for column, (label, field) in enumerate(self.dashboard_advanced_fields):
+                self.dashboard_advanced_layout.addWidget(label, 0, column)
+                self.dashboard_advanced_layout.addWidget(field, 1, column)
+                self.dashboard_advanced_layout.setColumnStretch(column, 1)
 
     def _build_generation_tab(self):
         tab = QWidget()
@@ -6159,34 +7221,31 @@ class ReportsDialog(LegacyReportsDialog):
 
         config_box = QGroupBox("Configuración del reporte PDF")
         cfg = QGridLayout(config_box)
-        self.report_type = QComboBox()
-        self.report_type.addItems(["Diario", "Semanal", "Mensual", "Anual"])
-        self.report_type.addItem("Período personalizado")
-        self.date_from = QDateEdit(QDate.currentDate())
-        self.date_to = QDateEdit(QDate.currentDate())
-        for field in (self.date_from, self.date_to):
-            field.setCalendarPopup(True)
-            field.setDisplayFormat("yyyy-MM-dd")
-        self.ars_filter = QComboBox()
-        self.ars_filter.addItem("Todas las ARS")
-        self.ars_filter.addItems(ars_list())
-        self.user_filter = QComboBox()
-        self.user_filter.addItem("Todos los Usuarios")
-        self.user_filter.addItems(list_usernames())
+        self.report_period_selector = PeriodSelectorWidget()
+        self.ars_filter = MultiSelectFilter(
+            ars_list(), "Todas las ARS", "ARS", feminine=True
+        )
+        self.user_filter = MultiSelectFilter(
+            list_usernames(), "Todos los facturadores", "facturador"
+        )
         self.btn_generate = QPushButton("Generar y abrir reporte PDF")
         self.btn_generate.setMinimumHeight(44)
         set_button_role(self.btn_generate, "report")
+        report_filter_hint = QLabel(
+            "Abre cada filtro para incluir o excluir varias opciones. Los cambios se confirmarán "
+            "solo al pulsar Aplicar filtro."
+        )
+        report_filter_hint.setWordWrap(True)
+        report_filter_hint.setStyleSheet(
+            "background: #F7FAFE; color: #52657A; border-radius: 7px; padding: 8px 10px;"
+        )
 
-        cfg.addWidget(QLabel("Tipo:"), 0, 0)
-        cfg.addWidget(self.report_type, 0, 1)
-        cfg.addWidget(QLabel("ARS:"), 0, 2)
-        cfg.addWidget(self.ars_filter, 0, 3)
-        cfg.addWidget(QLabel("Facturador:"), 1, 0)
-        cfg.addWidget(self.user_filter, 1, 1)
-        cfg.addWidget(QLabel("Desde:"), 2, 0)
-        cfg.addWidget(self.date_from, 2, 1)
-        cfg.addWidget(QLabel("Hasta:"), 2, 2)
-        cfg.addWidget(self.date_to, 2, 3)
+        cfg.addWidget(self.report_period_selector, 0, 0, 1, 4)
+        cfg.addWidget(QLabel("ARS:"), 1, 0)
+        cfg.addWidget(self.ars_filter, 1, 1)
+        cfg.addWidget(QLabel("Facturador:"), 1, 2)
+        cfg.addWidget(self.user_filter, 1, 3)
+        cfg.addWidget(report_filter_hint, 2, 0, 1, 4)
         cfg.addWidget(self.btn_generate, 3, 0, 1, 4)
         layout.addWidget(config_box)
 
@@ -6200,14 +7259,9 @@ class ReportsDialog(LegacyReportsDialog):
         layout.addStretch(1)
         self.tabs.addTab(tab, "Generar reporte PDF")
 
-        self.report_type.currentTextChanged.connect(self.sync_dates_for_type)
-        self.report_type.currentTextChanged.connect(self.update_report_preview)
-        self.date_from.dateChanged.connect(self._on_date_from_changed)
-        self.date_to.dateChanged.connect(self._on_date_to_changed)
-        self.date_from.dateChanged.connect(self.update_report_preview)
-        self.date_to.dateChanged.connect(self.update_report_preview)
-        self.ars_filter.currentTextChanged.connect(self.update_report_preview)
-        self.user_filter.currentTextChanged.connect(self.update_report_preview)
+        self.report_period_selector.periodChanged.connect(self.update_report_preview)
+        self.ars_filter.selectionChanged.connect(self.update_report_preview)
+        self.user_filter.selectionChanged.connect(self.update_report_preview)
         self.btn_generate.clicked.connect(self.generate_selected_report)
         self.update_report_preview()
 
@@ -6227,19 +7281,24 @@ class ReportsDialog(LegacyReportsDialog):
         tools.addWidget(self.btn_history_refresh)
         layout.addLayout(tools)
 
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["Tipo", "Desde", "Hasta", "Generado en la fecha", "Por", "Archivo", "JSON", "ID", "Tabla"]
+            ["Tipo", "Desde", "Hasta", "Generado el", "Por", "Archivo", "JSON", "ID", "Tabla",
+             "Período actual", "Comparado con"]
         )
-        for column in (6, 7, 8):
+        for column in (5, 6, 7, 8):
             self.table.setColumnHidden(column, True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 180)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.moveSection(header.visualIndex(9), 1)
+        header.moveSection(header.visualIndex(10), 2)
+        header.setSectionResizeMode(9, QHeaderView.Stretch)
+        header.setSectionResizeMode(10, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 125)
         self.table.setColumnWidth(1, 100)
         self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 150)
-        self.table.setColumnWidth(4, 160)
+        self.table.setColumnWidth(3, 135)
+        self.table.setColumnWidth(4, 130)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -6248,10 +7307,16 @@ class ReportsDialog(LegacyReportsDialog):
 
         buttons = QHBoxLayout()
         self.btn_open = QPushButton("Abrir PDF")
+        self.btn_history_save = QPushButton("Guardar copia")
+        self.btn_history_print = QPushButton("Vista previa e imprimir")
         self.btn_delete = QPushButton("Eliminar reporte")
         set_button_role(self.btn_open, "report")
+        set_button_role(self.btn_history_save, "success")
+        set_button_role(self.btn_history_print, "report")
         set_button_role(self.btn_delete, "danger")
         buttons.addWidget(self.btn_open)
+        buttons.addWidget(self.btn_history_save)
+        buttons.addWidget(self.btn_history_print)
         buttons.addWidget(self.btn_delete)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -6260,50 +7325,153 @@ class ReportsDialog(LegacyReportsDialog):
         self.search_edit.textChanged.connect(self.filter_history)
         self.btn_history_refresh.clicked.connect(self.load_rows)
         self.btn_open.clicked.connect(self.open_selected)
+        self.btn_history_save.clicked.connect(self.save_selected_report_copy)
+        self.btn_history_print.clicked.connect(self.print_selected_report)
         self.btn_delete.clicked.connect(self.delete_selected_report)
         self.table.itemDoubleClicked.connect(self.open_selected)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
 
-    def update_dashboard_period(self, _text=None, refresh=True):
-        today = QDate.currentDate()
-        preset = self.dashboard_period.currentText()
-        custom = preset == "Período personalizado"
-        self.dashboard_from.setEnabled(custom)
-        self.dashboard_to.setEnabled(custom)
-        if not custom:
-            if preset == "Mes actual":
-                start, end = QDate(today.year(), today.month(), 1), today
-            elif preset == "Últimos 12 meses":
-                start = QDate(today.addMonths(-11).year(), today.addMonths(-11).month(), 1)
-                end = today
-            elif preset == "Año anterior":
-                start, end = QDate(today.year() - 1, 1, 1), QDate(today.year() - 1, 12, 31)
-            else:
-                start, end = QDate(today.year(), 1, 1), today
-            self.dashboard_from.setDate(start)
-            self.dashboard_to.setDate(end)
+    def update_dashboard_period(self, _definition=None, refresh=True):
+        self._update_dashboard_compare_summary()
+        self._mark_dashboard_stale()
         if refresh:
-            self.refresh_dashboard()
+            self.dashboard_status.setText("Período ajustado. Pulsa Actualizar panel para aplicarlo.")
+
+    def _dashboard_compare_toggled(self, checked):
+        self.btn_dashboard_compare.setText(
+            "✓ Comparación activada" if checked else "Comparar período actual"
+        )
+        set_button_role(self.btn_dashboard_compare, "report" if checked else "neutral")
+        self._update_dashboard_compare_summary()
+        self._mark_dashboard_stale()
+
+    def _update_dashboard_compare_summary(self):
+        if not hasattr(self, "dashboard_compare_summary"):
+            return
+        checked = self.btn_dashboard_compare.isChecked()
+        self.dashboard_compare_summary.setVisible(checked)
+        if checked:
+            definition = self.dashboard_period_selector.definition()
+            self.dashboard_compare_summary.setText(
+                f"Comparando: {definition['period_label']} "
+                f"({self._display_iso_date(definition['start_date'])}–"
+                f"{self._display_iso_date(definition['end_date'])}) contra "
+                f"{definition['comparison_label']} "
+                f"({self._display_iso_date(definition['comparison_start'])}–"
+                f"{self._display_iso_date(definition['comparison_end'])})"
+            )
+
+    def _toggle_dashboard_advanced(self, checked):
+        self.dashboard_advanced_box.setVisible(checked)
+        self._update_dashboard_filter_preview()
+        self.btn_dashboard_advanced.setText(
+            ("▾ Más filtros" if checked else "▸ Más filtros") + self._advanced_filter_count_text()
+        )
+
+    def _advanced_filter_count(self):
+        return sum((
+            self.dashboard_category.currentIndex() > 0,
+            self.dashboard_granularity.currentIndex() > 0,
+        ))
+
+    def _advanced_filter_count_text(self):
+        count = self._advanced_filter_count()
+        return f" · {count} activo{'s' if count != 1 else ''}" if count else ""
+
+    @staticmethod
+    def _join_filter_values(values):
+        values = list(values)
+        if len(values) <= 1:
+            return "".join(values)
+        return ", ".join(values[:-1]) + " y " + values[-1]
+
+    def _selection_preview(self, selector, all_text, subject):
+        values = selector.selected_values()
+        if not values:
+            return all_text
+        joined = self._join_filter_values(values)
+        if selector.mode() == "exclude":
+            return f"{all_text} excepto {joined}"
+        return f"{subject}: {joined}"
+
+    def _period_preview(self):
+        return self.dashboard_period_selector.definition()["period_label"]
+
+    @staticmethod
+    def _display_iso_date(value):
+        parsed = QDate.fromString(str(value or ""), "yyyy-MM-dd")
+        return parsed.toString("dd/MM/yyyy") if parsed.isValid() else str(value or "")
+
+    def _update_dashboard_filter_preview(self):
+        if not hasattr(self, "dashboard_filter_summary"):
+            return
+        ars_text = self._selection_preview(self.dashboard_ars, "Todas las ARS", "ARS")
+        users_text = self._selection_preview(
+            self.dashboard_user, "Todos los facturadores", "Facturadores"
+        )
+        coverage_text = {
+            "Todas": "Todas las coberturas",
+            "Asegurados": "Solo asegurados",
+            "No asegurados": "Solo no asegurados",
+        }.get(self.dashboard_coverage.currentText(), self.dashboard_coverage.currentText())
+        advanced_count = self._advanced_filter_count()
+        advanced_text = (
+            f"{advanced_count} filtro{'s' if advanced_count != 1 else ''} adicional"
+            f"{'es' if advanced_count != 1 else ''}"
+            if advanced_count else "Sin filtros adicionales"
+        )
+        self.dashboard_filter_summary.setText(
+            f"Mostrando: {self._period_preview()} · {ars_text} · {users_text} · "
+            f"{coverage_text} · {advanced_text}"
+        )
+        self.btn_dashboard_advanced.setText(
+            ("▾ Más filtros" if self.btn_dashboard_advanced.isChecked() else "▸ Más filtros")
+            + self._advanced_filter_count_text()
+        )
+
+    def _dashboard_previous_period(self):
+        definition = self.dashboard_period_selector.definition()
+        return (
+            QDate.fromString(definition["comparison_start"], "yyyy-MM-dd"),
+            QDate.fromString(definition["comparison_end"], "yyyy-MM-dd"),
+        )
+
+    def _dashboard_trend_granularity(self):
+        selected = self.dashboard_granularity.currentText()
+        explicit = {"Diario": "day", "Semanal": "week", "Mensual": "month"}
+        if selected in explicit:
+            return explicit[selected]
+        definition = self.dashboard_period_selector.definition()
+        start = QDate.fromString(definition["start_date"], "yyyy-MM-dd")
+        end = QDate.fromString(definition["end_date"], "yyyy-MM-dd")
+        days = start.daysTo(end) + 1
+        return "day" if days <= 45 else "week" if days <= 180 else "month"
 
     def refresh_dashboard(self, *_args):
         if not self._ensure_panel_access():
             return
         if self._dashboard_worker and self._dashboard_worker.isRunning():
             return
-        start_date = self.dashboard_from.date().toString("yyyy-MM-dd")
-        end_date = self.dashboard_to.date().toString("yyyy-MM-dd")
+        definition = self.dashboard_period_selector.definition()
+        start_date = definition["start_date"]
+        end_date = definition["end_date"]
         if end_date < start_date:
             FloatingToast("La fecha final no puede ser anterior a la inicial", self, is_error=True).show()
             return
+        previous_start, previous_end = self._dashboard_previous_period()
         parameters = (
             start_date,
             end_date,
-            self.dashboard_ars.currentText(),
-            self.dashboard_user.currentText(),
-            self.dashboard_medication.currentText(),
+            self.dashboard_ars.filter_data(),
+            self.dashboard_user.filter_data(),
+            "Todos los medicamentos",
             self.dashboard_category.currentText(),
-            "day",
+            self._dashboard_trend_granularity(),
+            self.dashboard_coverage.currentText(),
+            self.btn_dashboard_compare.isChecked(),
+            previous_start.toString("yyyy-MM-dd"),
+            previous_end.toString("yyyy-MM-dd"),
         )
         self._set_dashboard_busy(True, "Consultando y agrupando los datos...")
         worker = DashboardLoadWorker(parameters, self)
@@ -6314,14 +7482,37 @@ class ReportsDialog(LegacyReportsDialog):
         worker.start()
 
     def _dashboard_loaded(self, data):
+        data["period"] = copy.deepcopy(self.dashboard_period_selector.definition())
         self.dashboard_data = data
         self.render_dashboard()
+        has_data = bool(data.get("summary", {}).get("receipts"))
+        self.dashboard_results_tabs.setVisible(has_data)
+        self.dashboard_results_state.setVisible(not has_data)
+        if not has_data:
+            self.dashboard_results_state.setText(
+                "No se encontraron recibos para el período y los filtros seleccionados. "
+                "Ajusta la consulta y pulsa Actualizar panel."
+            )
+            self.dashboard_results_state.setStyleSheet(
+                "background: #FFF8E8; color: #7A4B00; border: 1px solid #E7C775; "
+                "border-radius: 8px; padding: 11px 13px; font-weight: 700;"
+            )
         self.dashboard_status.setText(
             f"Datos actualizados: {datetime.now():%d/%m/%Y %H:%M:%S}"
         )
 
     def _dashboard_failed(self, error):
         self.dashboard_data = None
+        self.dashboard_results_tabs.setVisible(False)
+        self.dashboard_results_state.setVisible(True)
+        self.dashboard_results_state.setText(
+            "No fue posible cargar las estadísticas. Verifica la conexión e inténtalo nuevamente. "
+            "Código: PANEL-DATA-001"
+        )
+        self.dashboard_results_state.setStyleSheet(
+            "background: #FDECEC; color: #A32121; border: 1px solid #E7B0B0; "
+            "border-radius: 8px; padding: 11px 13px; font-weight: 700;"
+        )
         self.dashboard_status.setText("No fue posible actualizar el panel.")
         self.dashboard_guide.setText(
             "No se pudieron cargar las estadísticas. Verifica la conexión y vuelve a intentarlo. "
@@ -6331,10 +7522,19 @@ class ReportsDialog(LegacyReportsDialog):
 
     def _set_dashboard_busy(self, busy, message=None):
         self.btn_dashboard_refresh.setEnabled(not busy)
+        self.btn_dashboard_compare.setEnabled(not busy)
+        self.btn_dashboard_advanced.setEnabled(not busy)
         self.btn_dashboard_clear.setEnabled(not busy)
         can_export = bool(not busy and self.dashboard_data)
         self.btn_export_excel.setEnabled(can_export)
         self.btn_export_panel_pdf.setEnabled(can_export)
+        self.btn_dashboard_export.setEnabled(can_export)
+        self.btn_print_comparison.setEnabled(
+            bool(can_export and self.btn_dashboard_compare.isChecked()
+                 and self.dashboard_data.get("previous", {}).get("receipts"))
+            if self.dashboard_data else False
+        )
+        self.dashboard_period_selector.setEnabled(not busy)
         for _label, field in self.dashboard_filter_fields:
             field.setEnabled(not busy)
         for field in (
@@ -6342,33 +7542,61 @@ class ReportsDialog(LegacyReportsDialog):
             self.dashboard_evolution_metric,
         ):
             field.setEnabled(not busy)
-        if not busy:
-            self.update_dashboard_period(refresh=False)
         if message:
             self.dashboard_status.setText(message)
+        if busy:
+            self.dashboard_results_state.setVisible(True)
+            self.dashboard_results_state.setText(
+                message or "Cargando y organizando los resultados del período seleccionado..."
+            )
+            self.dashboard_results_state.setStyleSheet(
+                "background: #EDF4FD; color: #24415F; border: 1px solid #C4D7EF; "
+                "border-radius: 8px; padding: 11px 13px; font-weight: 700;"
+            )
+            if not self.dashboard_data:
+                self.dashboard_results_tabs.setVisible(False)
+        elif self.dashboard_data and self.dashboard_data.get("summary", {}).get("receipts"):
+            self.dashboard_results_state.setVisible(False)
+            self.dashboard_results_tabs.setVisible(True)
 
     def clear_dashboard_filters(self):
-        self.dashboard_period.setCurrentText("Este año")
-        self.dashboard_ars.setCurrentIndex(0)
-        self.dashboard_user.setCurrentIndex(0)
-        self.dashboard_medication.setCurrentIndex(0)
+        today = QDate.currentDate()
+        self.dashboard_period_selector.period_type.setCurrentText("Mensual")
+        self.dashboard_period_selector.month.setCurrentIndex(today.month() - 1)
+        self.dashboard_period_selector.year.setValue(today.year())
+        self.dashboard_ars.clear_selection()
+        self.dashboard_user.clear_selection()
+        self.dashboard_ars.set_mode("include")
+        self.dashboard_user.set_mode("include")
+        self.dashboard_coverage.setCurrentIndex(0)
         self.dashboard_category.setCurrentIndex(0)
+        self.dashboard_granularity.setCurrentIndex(0)
+        self.btn_dashboard_advanced.setChecked(False)
+        self.btn_dashboard_compare.setChecked(False)
         self.dashboard_comparison_metric.setCurrentIndex(0)
         self.dashboard_evolution_metric.setCurrentIndex(0)
         self.update_dashboard_period(refresh=False)
         self.refresh_dashboard()
 
     def _mark_dashboard_stale(self, *_args):
+        self._update_dashboard_filter_preview()
         if self._dashboard_worker and self._dashboard_worker.isRunning():
             return
         self.btn_export_excel.setEnabled(False)
         self.btn_export_panel_pdf.setEnabled(False)
+        self.btn_dashboard_export.setEnabled(False)
+        self.btn_print_comparison.setEnabled(False)
         self.dashboard_status.setText("Filtros modificados. Pulsa Actualizar panel para aplicarlos.")
-        loaded_ars = (self.dashboard_data or {}).get("filters", {}).get("ars")
-        current_ars = self.dashboard_ars.currentText()
-        if current_ars != loaded_ars:
-            self.comparison_box.setVisible(False)
-            self.dashboard_table_box.setVisible(False)
+        self.dashboard_results_state.setVisible(True)
+        self.dashboard_results_state.setText(
+            "Los filtros cambiaron. Los resultados visibles corresponden a la consulta anterior; "
+            "pulsa Actualizar panel para aplicar los cambios."
+        )
+        self.dashboard_results_state.setStyleSheet(
+            "background: #FFF8E8; color: #7A4B00; border: 1px solid #E7C775; "
+            "border-radius: 8px; padding: 11px 13px; font-weight: 700;"
+        )
+        if self.dashboard_data:
             self._arrange_dashboard_charts()
 
     def _comparison_metric_key(self):
@@ -6390,20 +7618,110 @@ class ReportsDialog(LegacyReportsDialog):
         self.kpi_total.setText(f"RD$ {summary['total']:,.2f}")
         self.kpi_receipts.setText(f"{summary['receipts']:,}")
         self.kpi_average.setText(f"RD$ {summary['average']:,.2f}")
+        self.kpi_room.setText(f"RD$ {summary.get('room', 0):,.2f}")
 
-        current_value = summary["total"]
-        previous_value = data["previous"]["total"]
-        if previous_value:
-            variation = (current_value - previous_value) / previous_value * 100
-            direction = "aumentó" if variation >= 0 else "disminuyó"
-            self.comparison_label.setText(
-                f"Comparación con el período anterior: el total emitido {direction} "
-                f"{abs(variation):.1f}% (RD$ {previous_value:,.2f} → RD$ {current_value:,.2f})."
+        previous = data.get("previous") or {}
+        comparison_enabled = bool(data.get("filters", {}).get("compare_previous"))
+        self.dashboard_comparison_table.setRowCount(0)
+        self.dashboard_categories_comparison.setRowCount(0)
+
+        def display_date(value):
+            try:
+                return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except (TypeError, ValueError):
+                return str(value or "")
+
+        def money_text(value, signed=False):
+            value = float(value or 0)
+            if signed:
+                sign = "+" if value > 0 else "-" if value < 0 else ""
+                return f"{sign}RD$ {abs(value):,.2f}"
+            return f"RD$ {value:,.2f}"
+
+        def variation_style(value):
+            if value is None or abs(value) < 0.0001:
+                return "•", QColor("#66788A"), QColor("#EEF2F6")
+            if value > 0:
+                return "▲", QColor("#0B7A5A"), QColor("#E6F5EF")
+            return "▼", QColor("#C62828"), QColor("#FDECEC")
+
+        if comparison_enabled and previous.get("receipts", 0):
+            self.dashboard_comparison_table.setVisible(True)
+            self.dashboard_categories_comparison_box.setVisible(True)
+            metric_specs = [
+                ("Recibos", "receipts", False),
+                ("Total emitido", "total", True),
+                ("Promedio por recibo", "average", True),
+                ("Sala de emergencia", "room", True),
+            ]
+            period = data.get("period", {})
+            self.dashboard_comparison_periods.setText(
+                f"Actual: {period.get('period_label', 'Período actual')} · "
+                f"{display_date(data['start_date'])} al {display_date(data['end_date'])}\n"
+                f"Anterior: {period.get('comparison_label', 'Período anterior')} · "
+                f"{display_date(data['previous_start'])} al {display_date(data['previous_end'])}"
             )
+            self.dashboard_comparison_table.setRowCount(len(metric_specs))
+            for row_index, (label, key, currency) in enumerate(metric_specs):
+                current_value = float(summary.get(key, 0))
+                previous_value = float(previous.get(key, 0))
+                difference = current_value - previous_value
+                variation = difference / previous_value * 100 if previous_value else None
+                icon, color, background = variation_style(variation)
+                values = [
+                    label,
+                    money_text(current_value) if currency else f"{int(current_value):,}",
+                    money_text(previous_value) if currency else f"{int(previous_value):,}",
+                    money_text(difference, signed=True) if currency else f"{difference:+,.0f}",
+                    f"{icon} {variation:+.1f}%" if variation is not None else "• Sin base",
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setTextAlignment(
+                        Qt.AlignLeft | Qt.AlignVCenter if column == 0
+                        else Qt.AlignRight | Qt.AlignVCenter
+                    )
+                    if column in (3, 4):
+                        item.setForeground(color)
+                        item.setBackground(background)
+                        font = item.font(); font.setBold(True); item.setFont(font)
+                    self.dashboard_comparison_table.setItem(row_index, column, item)
+                self.dashboard_comparison_table.setRowHeight(row_index, 36)
+
+            category_rows = data.get("category_comparison", [])
+            self.dashboard_categories_comparison.setRowCount(len(category_rows))
+            self.dashboard_categories_comparison.setMinimumHeight(
+                max(130, 42 + len(category_rows) * 32)
+            )
+            for row_index, row in enumerate(category_rows):
+                current_value = float(row.get("current", 0))
+                previous_value = float(row.get("previous", 0))
+                variation = (
+                    (current_value - previous_value) / previous_value * 100
+                    if previous_value else None
+                )
+                icon, color, background = variation_style(variation)
+                label_item = QTableWidgetItem(str(row.get("label", "")))
+                variation_item = QTableWidgetItem(
+                    f"{icon} {variation:+.1f}%" if variation is not None else "• Sin base comparable"
+                )
+                variation_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                variation_item.setForeground(color)
+                variation_item.setBackground(background)
+                font = variation_item.font(); font.setBold(True); variation_item.setFont(font)
+                self.dashboard_categories_comparison.setItem(row_index, 0, label_item)
+                self.dashboard_categories_comparison.setItem(row_index, 1, variation_item)
+                self.dashboard_categories_comparison.setRowHeight(row_index, 32)
+            self.dashboard_comparison_panel.setVisible(True)
+        elif comparison_enabled:
+            self.dashboard_comparison_periods.setText(
+                "No existen datos en el período anterior para realizar una comparación válida."
+            )
+            self.dashboard_comparison_table.setVisible(False)
+            self.dashboard_categories_comparison_box.setVisible(False)
+            self.dashboard_comparison_panel.setVisible(True)
         else:
-            self.comparison_label.setText(
-                "El período anterior no tiene datos comparables. El panel muestra únicamente el período actual."
-            )
+            self.dashboard_comparison_panel.setVisible(False)
 
         comparison_metric = self._comparison_metric_key()
         evolution_metric = self._evolution_metric_key()
@@ -6417,16 +7735,32 @@ class ReportsDialog(LegacyReportsDialog):
         distribution_entries = [
             (row["label"], row["total"]) for row in data.get("category_distribution", data["categories"])
         ]
+        coverage_rows = list(data.get("coverage", []))
+        coverage_total = sum(row.get("receipts", 0) for row in coverage_rows)
+        coverage_entries = [
+            (row["label"], row.get("receipts", 0) / coverage_total * 100 if coverage_total else 0)
+            for row in coverage_rows
+        ]
         evolution_currency = evolution_metric in ("total", "average")
-        self.comparison_chart.set_entries(comparison_entries, currency=False, percent=True)
+        self.comparison_chart.set_entries(comparison_entries, percent=True)
         self.category_bar_chart.set_entries(category_entries, currency=True)
         self.line_chart.set_entries(trend_entries, currency=evolution_currency)
         self.donut_chart.set_entries(distribution_entries)
+        self.coverage_chart.set_entries(coverage_entries, percent=True)
         self.comparison_box.setTitle("Distribución porcentual por ARS")
-        self.line_box.setTitle("Evolución diaria")
+        granularity_title = {"day": "diaria", "week": "semanal", "month": "mensual"}.get(
+            data.get("filters", {}).get("trend_granularity"), "temporal"
+        )
+        self.line_box.setTitle(f"Evolución {granularity_title}")
+        self.coverage_box.setVisible(bool(coverage_rows))
         self.comparison_box.setVisible(show_ars_comparison)
         self.dashboard_table_box.setVisible(show_ars_comparison)
-        self._arrange_dashboard_charts()
+        self.dashboard_results_tabs.setTabVisible(
+            self.dashboard_comparison_tab_index, comparison_enabled
+        )
+        self.dashboard_results_tabs.setTabVisible(
+            self.dashboard_detail_tab_index, show_ars_comparison
+        )
 
         data["comparison"] = comparison_rows
         data["view"] = {
@@ -6435,7 +7769,12 @@ class ReportsDialog(LegacyReportsDialog):
             "ars_metric_label": self.dashboard_comparison_metric.currentText(),
             "evolution_metric": evolution_metric,
             "evolution_label": self.dashboard_evolution_metric.currentText(),
+            "coverage_visible": bool(coverage_rows),
         }
+        self.btn_print_comparison.setEnabled(
+            bool(comparison_enabled and previous.get("receipts", 0))
+        )
+        self._arrange_dashboard_charts()
 
         self.dashboard_table.setRowCount(0)
         for row in data.get("summary_table", []):
@@ -6474,15 +7813,14 @@ class ReportsDialog(LegacyReportsDialog):
                 f"La ARS con mayor participación según {self.dashboard_comparison_metric.currentText().lower()} "
                 f"fue {best_group['label']} con {best_group[percentage_key] * 100:.1f}%."
             )
+        uninsured = next((row for row in coverage_rows if row["label"] == "No asegurados"), None)
+        if uninsured and coverage_total:
+            sentences.append(
+                f"Las atenciones no aseguradas fueron {uninsured['receipts']:,}, "
+                f"equivalentes al {uninsured['receipts'] / coverage_total * 100:.1f}% del período."
+            )
         self.dashboard_guide.setText(" ".join(sentences))
-        filters = data.get("filters", {})
-        self.dashboard_filter_summary.setText(
-            f"Período: {data['start_date']} al {data['end_date']}  |  "
-            f"ARS: {filters.get('ars', 'Todas las ARS')}  |  "
-            f"Facturador: {filters.get('user', 'Todos los Usuarios')}  |  "
-            f"Medicamento: {filters.get('medication', 'Todos')}  |  "
-            f"Categoría: {filters.get('category', 'Todas')}"
-        )
+        self._update_dashboard_filter_preview()
 
     def _metric_text(self, value, currency):
         return f"RD$ {float(value):,.2f}" if currency else f"{int(value):,} recibos"
@@ -6491,6 +7829,9 @@ class ReportsDialog(LegacyReportsDialog):
         compact = getattr(self, "_dashboard_compact", False)
         show_ars = bool(
             self.dashboard_data and self.dashboard_data.get("view", {}).get("show_ars_comparison")
+        )
+        show_coverage = bool(
+            self.dashboard_data and self.dashboard_data.get("view", {}).get("coverage_visible")
         )
         for widget in self._dashboard_chart_widgets:
             self.dashboard_charts_layout.removeWidget(widget)
@@ -6502,15 +7843,18 @@ class ReportsDialog(LegacyReportsDialog):
             if show_ars:
                 self.dashboard_charts_layout.addWidget(self.comparison_box, row, 0)
                 row += 1
-            self.dashboard_charts_layout.addWidget(self.line_box, row, 0)
+            if show_coverage:
+                self.dashboard_charts_layout.addWidget(self.coverage_box, row, 0)
         else:
             self.dashboard_charts_layout.addWidget(self.donut_box, 0, 0)
             self.dashboard_charts_layout.addWidget(self.category_box, 0, 1)
             if show_ars:
-                self.dashboard_charts_layout.addWidget(self.comparison_box, 1, 0)
-                self.dashboard_charts_layout.addWidget(self.line_box, 1, 1)
+                self.dashboard_charts_layout.addWidget(self.comparison_box, 1, 0, 1, 2)
+                next_row = 2
             else:
-                self.dashboard_charts_layout.addWidget(self.line_box, 1, 0, 1, 2)
+                next_row = 1
+            if show_coverage:
+                self.dashboard_charts_layout.addWidget(self.coverage_box, next_row, 0, 1, 2)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -6549,18 +7893,155 @@ class ReportsDialog(LegacyReportsDialog):
     def update_report_preview(self, *_args):
         if not hasattr(self, "report_preview"):
             return
+        definition = self.report_period_selector.definition()
+        ars_text = self._selection_preview(self.ars_filter, "Todas las ARS", "ARS")
+        user_text = self._selection_preview(
+            self.user_filter, "Todos los facturadores", "Facturadores"
+        )
         self.report_preview.setText(
-            f"Tipo: {self.report_type.currentText()}  |  "
-            f"Período: {self.date_from.date().toString('dd/MM/yyyy')} al "
-            f"{self.date_to.date().toString('dd/MM/yyyy')}\n"
-            f"ARS: {self.ars_filter.currentText()}  |  Facturador: {self.user_filter.currentText()}\n"
+            f"Período: {definition['period_label']}\n"
+            f"Fechas exactas: {self._display_iso_date(definition['start_date'])} al "
+            f"{self._display_iso_date(definition['end_date'])}\n"
+            f"ARS: {ars_text}\nFacturadores: {user_text}\n"
             "Criterio: fecha real de generación del recibo."
         )
 
+    def generate_selected_report(self):
+        definition = self.report_period_selector.definition()
+        start_date = definition["start_date"]
+        end_date = definition["end_date"]
+        ars_filter = self.ars_filter.filter_data()
+        user_filter = self.user_filter.filter_data()
+        if end_date < start_date:
+            FloatingToast("Fechas inválidas", self, is_error=True).show()
+            return
+        try:
+            if definition["period_type"] == "Diario":
+                path = generate_daily_report_pdf(
+                    start_date, self.current_user["username"], None, ars_filter, user_filter
+                )
+            else:
+                path = generate_period_report_pdf(
+                    definition["period_label"], start_date, end_date,
+                    self.current_user["username"], None, ars_filter, user_filter,
+                    period_metadata=definition,
+                )
+            if not path:
+                QMessageBox.information(self, "Reportes", "No hay datos para ese período.")
+                return
+            self.load_rows()
+            FloatingToast("✅ Reporte generado", self).show()
+            if not open_file_path(path):
+                QMessageBox.warning(
+                    self, "Reportes",
+                    f"El reporte se generó, pero no se pudo abrir automáticamente:\n{path}",
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Reportes", f"No se pudo generar el reporte:\n{exc}")
+
     def load_rows(self):
         super().load_rows()
+        for row in range(self.table.rowCount()):
+            raw_type = self.table.item(row, 0).text() if self.table.item(row, 0) else "Reporte PDF"
+            raw_json = self.table.item(row, 6).text() if self.table.item(row, 6) else "{}"
+            try:
+                metadata = json.loads(raw_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            period = metadata.get("period") or metadata.get("_period") or {}
+            is_comparison = raw_type.startswith("Reporte comparativo")
+            display_type = "Comparativo" if is_comparison else (
+                "Diario" if raw_type.startswith("Diario") else "Reporte PDF"
+            )
+            current_period = period.get("period_label") or raw_type.split(" (")[0]
+            compared_period = period.get("comparison_label", "") if is_comparison else ""
+            type_item = QTableWidgetItem(display_type)
+            type_item.setToolTip(raw_type)
+            current_item = QTableWidgetItem(current_period)
+            current_item.setToolTip(current_period)
+            compared_item = QTableWidgetItem(compared_period or "No aplica")
+            compared_item.setToolTip(compared_period or "Este reporte no es comparativo")
+            self.table.setItem(row, 0, type_item)
+            self.table.setItem(row, 9, current_item)
+            self.table.setItem(row, 10, compared_item)
+            self.table.setRowHeight(row, 34)
         if hasattr(self, "history_count"):
             self.history_count.setText(f"{self.table.rowCount():,} reportes")
+
+    def _selected_report_path(self):
+        row = self.table.currentRow()
+        if row < 0:
+            FloatingToast("Selecciona un reporte", self, is_error=True).show()
+            return ""
+        stored_path = self.table.item(row, 5).text().strip() if self.table.item(row, 5) else ""
+        filename = os.path.basename(stored_path)
+        if not filename:
+            QMessageBox.warning(self, "Reportes", "Este reporte no tiene un archivo PDF asociado.")
+            return ""
+        path = stored_path if os.path.exists(stored_path) else stable_storage_path(REPORTS_DIR, filename)
+        if not os.path.exists(path):
+            with db_connect() as con:
+                result = con.execute(
+                    "SELECT file_data FROM pdf_storage WHERE filename=%s", (filename,)
+                ).fetchone()
+            if result:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as pdf_file:
+                    pdf_file.write(bytes(result["file_data"]))
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Reportes", "No se encontró el PDF de este reporte.")
+            return ""
+        return path
+
+    def save_selected_report_copy(self):
+        path = self._selected_report_path()
+        if not path:
+            return
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Guardar una copia del reporte", os.path.basename(path), "PDF (*.pdf)"
+        )
+        if not destination:
+            return
+        if not destination.lower().endswith(".pdf"):
+            destination += ".pdf"
+        try:
+            shutil.copy2(path, destination)
+            FloatingToast("Copia del reporte guardada", self).show()
+        except Exception as exc:
+            QMessageBox.critical(self, "Guardar copia", f"No se pudo guardar la copia:\n{exc}")
+
+    def print_selected_report(self):
+        path = self._selected_report_path()
+        if not path:
+            return
+        ComparisonPdfDialog(
+            path,
+            self,
+            dialog_title="Reporte listo para revisar",
+            detail_text=(
+                "Verifica el documento antes de imprimir. También puedes guardar una copia "
+                "en otra ubicación."
+            ),
+        ).exec()
+
+    def show_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        menu = QMenu(self)
+        actions = [
+            ("Abrir PDF", self.open_selected),
+            ("Guardar una copia", self.save_selected_report_copy),
+            ("Vista previa e imprimir", self.print_selected_report),
+        ]
+        for label, callback in actions:
+            action = menu.addAction(label)
+            action.triggered.connect(callback)
+        menu.addSeparator()
+        delete_action = menu.addAction("Eliminar reporte")
+        delete_action.triggered.connect(self.delete_selected_report)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def filter_history(self, text):
         filter_table_widget(self.table, text)
@@ -6579,6 +8060,33 @@ class ReportsDialog(LegacyReportsDialog):
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
         self._start_dashboard_export("xlsx", path)
+
+    def print_dashboard_comparison(self):
+        if not self._ensure_panel_access() or not self.dashboard_data:
+            FloatingToast("Actualiza el panel antes de imprimir", self, is_error=True).show()
+            return
+        if not self.btn_dashboard_compare.isChecked():
+            FloatingToast("Activa la comparación y actualiza el panel", self, is_error=True).show()
+            return
+        if not self.dashboard_data.get("previous", {}).get("receipts"):
+            FloatingToast(
+                "No existen datos en el período anterior para imprimir una comparación válida",
+                self,
+                is_error=True,
+            ).show()
+            return
+        try:
+            snapshot = copy.deepcopy(self.dashboard_data)
+            path = generate_comparison_report_pdf(
+                snapshot, self.current_user.get("username", "Usuario")
+            )
+            self.load_rows()
+            ComparisonPdfDialog(path, self).exec()
+        except Exception as exc:
+            write_runtime_log(f"Reporte comparativo: {exc}")
+            QMessageBox.critical(
+                self, "Imprimir comparación", f"No se pudo generar el reporte comparativo:\n{exc}"
+            )
 
     def export_dashboard_pdf(self):
         if not self._ensure_panel_access() or not self.dashboard_data:
@@ -6946,6 +8454,8 @@ class MainWindow(QMainWindow):
         billing_lay.addWidget(QLabel("Diagnóstico:"), 1, 0); billing_lay.addWidget(self.dx_edit, 1, 1, 1, 3)
 
         self.ars_combo = QComboBox(); self.ars_combo.addItems(ars_list()); self.ars_combo.setMaximumWidth(240)
+        self.coverage_combo = QComboBox()
+        self.coverage_combo.addItems(["Asegurado", "No asegurado"])
         self.sala_spin = QDoubleSpinBox(); self.sala_spin.setRange(0, 1_000_000); self.sala_spin.setDecimals(2); self.sala_spin.setSingleStep(SALA_STEP)
         self.sala_spin.valueChanged.connect(lambda v: self.update_totals())
 
@@ -6956,11 +8466,12 @@ class MainWindow(QMainWindow):
         
         billing_lay.addWidget(QLabel("ARS:"), 1, 4); billing_lay.addWidget(self.ars_combo, 1, 5)
         billing_lay.addWidget(QLabel("Sala de emergencia:"), 2, 0); billing_lay.addWidget(self.sala_spin, 2, 1)
+        billing_lay.addWidget(QLabel("Cobertura:"), 2, 4); billing_lay.addWidget(self.coverage_combo, 2, 5)
         actions = QHBoxLayout()
         actions.addStretch(1)
         actions.addWidget(self.btn_add_catalog_item); actions.addWidget(self.btn_manage_catalog)
         actions.addWidget(self.btn_ars_mgmt); actions.addWidget(self.btn_import_meds)
-        billing_lay.addLayout(actions, 2, 2, 1, 4)
+        billing_lay.addLayout(actions, 3, 0, 1, 6)
         
         content_lay.addWidget(billing_group)
 
@@ -7120,6 +8631,7 @@ class MainWindow(QMainWindow):
         root.addWidget(bottom_widget)
         
         self.ars_combo.currentTextChanged.connect(self.on_ars_changed)
+        self.coverage_combo.currentTextChanged.connect(self.on_coverage_changed)
         self.btn_add_catalog_item.clicked.connect(self.add_catalog_item_inline)
         self.btn_manage_catalog.clicked.connect(self.manage_current_catalog)
         self.btn_ars_mgmt.clicked.connect(self.open_ars_manager)
@@ -7682,6 +9194,26 @@ class MainWindow(QMainWindow):
 
         self.search_and_maybe_switch_tab()
 
+    def on_coverage_changed(self, coverage):
+        """Separa la condición de cobertura de las aseguradoras reales."""
+        uninsured = coverage == "No asegurado"
+        self.ars_combo.setEnabled(not uninsured)
+        self.btn_ars_mgmt.setEnabled(not uninsured)
+        if uninsured:
+            self.ars_combo.blockSignals(True)
+            self.ars_combo.setCurrentIndex(-1)
+            self.ars_combo.blockSignals(False)
+            self.current_ars = ""
+            self.locked_ars = None
+            for category in ARS_CATEGORIES:
+                self.ars_cache[category] = {}
+            self.refresh_picker()
+            self.sala_spin.setValue(0.0)
+        elif self.ars_combo.count() > 0:
+            self.ars_combo.setCurrentIndex(0)
+            self.on_ars_changed(self.ars_combo.currentText())
+        self.update_totals()
+
     def add_selected_item(self, category_override=None):
         self.mark_activity()
         category = category_override or self.get_current_category()
@@ -7785,7 +9317,7 @@ class MainWindow(QMainWindow):
             elif "Materiales" in cat:
                 materiales_sub += sub
         
-        total += self.sala_spin.value() if self.current_ars else 0.0
+        total += self.sala_spin.value()
         
         txt = f"Total: RD$ {total:,.2f}"
         self.lbl_total.setText(txt)
@@ -7814,6 +9346,7 @@ class MainWindow(QMainWindow):
         self.name_edit.clear()
         self.dx_edit.clear()
         self.date_edit.setDate(QDate.currentDate())
+        self.coverage_combo.setCurrentText("Asegurado")
         self._responsive_mode = None
         self._update_responsive_ui()
 
@@ -7838,6 +9371,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        coverage = data.get("tipo_cobertura") or ("NO_ASEGURADO" if not data.get("ars") else "ASEGURADO")
+        self.coverage_combo.setCurrentText("No asegurado" if coverage == "NO_ASEGURADO" else "Asegurado")
         ars_name = data["ars"]
         if ars_name in [self.ars_combo.itemText(i) for i in range(self.ars_combo.count())]:
             self.ars_combo.setCurrentText(ars_name)
@@ -7915,7 +9450,7 @@ class MainWindow(QMainWindow):
             
         grouped = [(c, grouped_dict[c]) for c in ALL_CATEGORIES if grouped_dict[c]]
 
-        sala = self.sala_spin.value() if self.current_ars else 0.0
+        sala = self.sala_spin.value()
         subtotales = {label: sum(sub for _, _, _, sub, _ in lst) for label, lst in grouped}
         total_general = sum(subtotales.values()) + sala
 
@@ -7931,6 +9466,7 @@ class MainWindow(QMainWindow):
             "date_str": date_str,
             "dx_raw": dx_raw,
             "ars_name": self.current_ars,
+            "coverage": "NO_ASEGURADO" if self.coverage_combo.currentText() == "No asegurado" else "ASEGURADO",
             "sala": sala,
             "grouped": grouped,
             "total_general": total_general,

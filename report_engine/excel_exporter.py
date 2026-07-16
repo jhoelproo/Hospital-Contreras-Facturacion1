@@ -89,13 +89,30 @@ def export_panel_xlsx(data: dict, output_path: str, generated_by: str, logo_path
     summary_ws["A5"].font = Font(size=10, color="52657A")
     summary_ws["A5"].alignment = Alignment(horizontal="center")
 
+    def selection_text(selection, empty):
+        if not isinstance(selection, dict) or not selection.get("values"):
+            return empty
+        mode = "Excluir" if selection.get("mode") in ("exclude", "excluir") else "Incluir"
+        return f"{mode}: {', '.join(selection['values'])}"
+    filters = data.get("filters", {})
+    summary_ws.merge_cells("A6:L6")
+    summary_ws["A6"] = (
+        f"ARS: {selection_text(filters.get('ars'), 'Todas')}  |  "
+        f"Facturadores: {selection_text(filters.get('user'), 'Todos')}  |  "
+        f"Cobertura: {filters.get('coverage', 'Todas')}  |  "
+        f"Comparación: {'Sí' if filters.get('compare_previous') else 'No'}"
+    )
+    summary_ws["A6"].font = Font(size=9, color="52657A")
+    summary_ws["A6"].alignment = Alignment(horizontal="center")
+
     summary = data["summary"]
     view = data.get("view", {})
     show_ars_comparison = bool(view.get("show_ars_comparison"))
     cards = [
-        ("A", "D", "TOTAL DE RECIBOS", summary["receipts"], BLUE, "#,##0"),
-        ("E", "H", "TOTAL EMITIDO", summary["total"], GREEN, currency_format),
-        ("I", "L", "PROMEDIO POR RECIBO", summary["average"], ORANGE, currency_format),
+        ("A", "C", "TOTAL DE RECIBOS", summary["receipts"], BLUE, "#,##0"),
+        ("D", "F", "TOTAL EMITIDO", summary["total"], GREEN, currency_format),
+        ("G", "I", "PROMEDIO POR RECIBO", summary["average"], ORANGE, currency_format),
+        ("J", "L", "SALA DE EMERGENCIA", summary.get("room", 0), PURPLE, currency_format),
     ]
     for first_col, last_col, label, value, color, number_format in cards:
         summary_ws.merge_cells(f"{first_col}7:{last_col}7")
@@ -267,37 +284,37 @@ def export_panel_xlsx(data: dict, output_path: str, generated_by: str, logo_path
         summary_ws.column_dimensions[summary_ws.cell(1, column).column_letter].hidden = True
 
     detail_headers = [
-        "Recibo", "Fecha generada", "Usuario", "ARS", "Categoría", "Artículo",
+        "Recibo", "Fecha generada", "Usuario", "ARS", "Cobertura", "Categoría", "Artículo",
         "Cantidad", "Precio unitario", "Total",
     ]
     data_ws.append(detail_headers)
     for detail in data.get("details", []):
         data_ws.append([
             detail["receipt"], _excel_datetime(detail["created_at"]), _safe_excel_value(detail["username"]), _safe_excel_value(detail["ars"]),
-            _safe_excel_value(detail["category"]), _safe_excel_value(detail["item"]), detail["quantity"],
+            _safe_excel_value(detail.get("coverage", "")), _safe_excel_value(detail["category"]), _safe_excel_value(detail["item"]), detail["quantity"],
             detail["unit_price"], detail["total"],
         ])
     for cell in data_ws[1]:
         cell.fill = PatternFill("solid", fgColor=BLUE)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.alignment = Alignment(horizontal="center")
-    for row in data_ws.iter_rows(min_row=2, max_col=9):
+    for row in data_ws.iter_rows(min_row=2, max_col=10):
         for cell in row:
             cell.border = Border(bottom=Side(style="hair", color=GRID))
-        row[7].number_format = currency_format
         row[8].number_format = currency_format
+        row[9].number_format = currency_format
         row[1].number_format = "yyyy-mm-dd hh:mm:ss"
     if data_ws.max_row > 1:
-        data_table = Table(displayName="PanelDetailTable", ref=f"A1:I{data_ws.max_row}")
+        data_table = Table(displayName="PanelDetailTable", ref=f"A1:J{data_ws.max_row}")
         data_table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
             showRowStripes=True, showColumnStripes=False,
         )
         data_ws.add_table(data_table)
     data_ws.freeze_panes = "A2"
-    data_ws.auto_filter.ref = f"A1:I{max(1, data_ws.max_row)}"
+    data_ws.auto_filter.ref = f"A1:J{max(1, data_ws.max_row)}"
 
-    widths = {"A": 12, "B": 22, "C": 18, "D": 24, "E": 20, "F": 40, "G": 12, "H": 18, "I": 18}
+    widths = {"A": 12, "B": 22, "C": 18, "D": 24, "E": 18, "F": 20, "G": 40, "H": 12, "I": 18, "J": 18}
     for column, width in widths.items():
         data_ws.column_dimensions[column].width = width
     for column in "ABCDEFGHIJKLM":
