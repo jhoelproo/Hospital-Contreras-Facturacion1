@@ -15,6 +15,19 @@ from pdf_engine.renderer import render_html_to_pdf
 ROOT = Path(__file__).resolve().parent
 
 
+def _display_date(value) -> str:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+def _signed_money(value) -> str:
+    value = float(value or 0)
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}RD$ {abs(value):,.2f}"
+
+
 def _logo_data_url(path: str = "") -> str:
     logo = Path(path) if path else None
     if not logo or not logo.is_file():
@@ -133,12 +146,52 @@ def doughnut_chart_svg(entries, title="Distribución") -> str:
     return "".join(parts)
 
 
+def paired_bar_chart_svg(entries, title="Comparación") -> str:
+    """Barras horizontales dobles; cada indicador conserva su propia escala."""
+    entries = list(entries or [])
+    if not entries:
+        return '<div class="empty-chart">Sin datos</div>'
+    width = 900
+    row_height = 76
+    height = 44 + row_height * len(entries) + 28
+    left, right = 190, 125
+    plot_width = width - left - right
+    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{html.escape(title)}">']
+    parts.extend([
+        '<rect x="610" y="12" width="14" height="14" rx="3" class="bar-current"/>',
+        '<text x="631" y="24" class="chart-label">Período actual</text>',
+        '<rect x="744" y="12" width="14" height="14" rx="3" class="bar-previous"/>',
+        '<text x="765" y="24" class="chart-label">Anterior</text>',
+    ])
+    for index, row in enumerate(entries):
+        current = float(row.get("current", 0) or 0)
+        previous = float(row.get("previous", 0) or 0)
+        maximum = max(abs(current), abs(previous), 1)
+        y = 48 + index * row_height
+        current_width = plot_width * abs(current) / maximum
+        previous_width = plot_width * abs(previous) / maximum
+        currency = bool(row.get("currency", True))
+        current_text = _compact_money(current) if currency else f"{int(current):,}"
+        previous_text = _compact_money(previous) if currency else f"{int(previous):,}"
+        parts.extend([
+            f'<text x="{left - 12}" y="{y + 22}" class="pair-label" text-anchor="end">{html.escape(str(row.get("label", ""))[:28])}</text>',
+            f'<rect x="{left}" y="{y}" width="{current_width:.1f}" height="22" rx="4" class="bar-current"/>',
+            f'<rect x="{left}" y="{y + 29}" width="{previous_width:.1f}" height="22" rx="4" class="bar-previous"/>',
+            f'<text x="{min(width - 5, left + current_width + 8):.1f}" y="{y + 16}" class="pair-value">{current_text}</text>',
+            f'<text x="{min(width - 5, left + previous_width + 8):.1f}" y="{y + 45}" class="pair-value">{previous_text}</text>',
+        ])
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 class ReportHTMLRenderer:
     def __init__(self):
         self.env = Environment(
             loader=FileSystemLoader(str(ROOT)),
             autoescape=select_autoescape(["html", "xml"]),
         )
+        self.env.filters["display_date"] = _display_date
+        self.env.filters["signed_money"] = _signed_money
         self.template = self.env.get_template("report_template.html")
         self.styles = (ROOT / "report_styles.css").read_text(encoding="utf-8")
 
@@ -147,7 +200,36 @@ class ReportHTMLRenderer:
         prepared.setdefault("generated_at", datetime.now().strftime("%d/%m/%Y %H:%M"))
         prepared["styles"] = self.styles
         prepared["logo_url"] = _logo_data_url(prepared.get("logo_path", ""))
-        if prepared.get("mode") == "panel":
+        if prepared.get("mode") in ("panel", "comparison"):
+            data = prepared["data"]
+            view = data.get("view", {})
+            def selection_text(selection, empty):
+                if not isinstance(selection, dict) or not selection.get("values"):
+                    return empty
+                mode = "Excluir" if selection.get("mode") in ("exclude", "excluir") else "Incluir"
+                return f"{mode}: {', '.join(selection['values'])}"
+            filters = data.get("filters", {})
+            prepared["filter_ars"] = selection_text(filters.get("ars"), "Todas")
+            prepared["filter_users"] = selection_text(filters.get("user"), "Todos")
+        if prepared.get("mode") == "comparison":
+            data = prepared["data"]
+            summary = data.get("summary", {})
+            previous = data.get("previous", {})
+            prepared["comparison_rows"] = [
+                {"label": "Total de recibos", "current": summary.get("receipts", 0), "previous": previous.get("receipts", 0), "currency": False},
+                {"label": "Total emitido", "current": summary.get("total", 0), "previous": previous.get("total", 0), "currency": True},
+                {"label": "Promedio por recibo", "current": summary.get("average", 0), "previous": previous.get("average", 0), "currency": True},
+                {"label": "Sala de emergencia", "current": summary.get("room", 0), "previous": previous.get("room", 0), "currency": True},
+            ]
+            prepared["category_comparison_rows"] = list(data.get("category_comparison", []))
+            prepared["indicator_comparison_svg"] = paired_bar_chart_svg(
+                prepared["comparison_rows"], "Comparación de indicadores"
+            )
+            prepared["category_comparison_svg"] = paired_bar_chart_svg(
+                [{**row, "currency": True} for row in prepared["category_comparison_rows"]],
+                "Comparación por categorías",
+            )
+        elif prepared.get("mode") == "panel":
             data = prepared["data"]
             view = data.get("view", {})
             ars_metric = prepared.get("ars_metric", view.get("ars_metric", "total"))
@@ -170,6 +252,14 @@ class ReportHTMLRenderer:
             )
             prepared["donut_svg"] = doughnut_chart_svg(
                 data.get("category_distribution", data.get("categories"))
+            )
+            coverage_total = sum(float(row.get("receipts", 0) or 0) for row in data.get("coverage", []))
+            coverage_rows = [
+                {**row, "percentage_value": (float(row.get("receipts", 0) or 0) / coverage_total * 100) if coverage_total else 0}
+                for row in data.get("coverage", [])
+            ]
+            prepared["coverage_svg"] = bar_chart_svg(
+                coverage_rows, "percentage_value", "Distribución por tipo de cobertura"
             )
         return self.template.render(**prepared)
 

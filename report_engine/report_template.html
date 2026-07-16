@@ -27,18 +27,93 @@
     </div>
   </section>
 
-  {% if mode == "panel" %}
+  {% if mode == "comparison" %}
+    {% set period = data.get('period', {}) %}
+    <section class="period-comparison">
+      <article>
+        <span>PERÍODO ACTUAL</span>
+        <strong>{{ period.get('period_label', 'Período actual') }}</strong>
+        <small>{{ data.start_date|display_date }} al {{ data.end_date|display_date }}</small>
+      </article>
+      <div class="versus">VS</div>
+      <article>
+        <span>PERÍODO COMPARADO</span>
+        <strong>{{ period.get('comparison_label', 'Período anterior') }}</strong>
+        <small>{{ data.previous_start|display_date }} al {{ data.previous_end|display_date }}</small>
+      </article>
+    </section>
+    <section class="filter-summary">
+      <strong>Filtros aplicados:</strong>
+      ARS: {{ filter_ars }} · Facturadores: {{ filter_users }} ·
+      Cobertura: {{ data.filters.coverage }} · Categoría: {{ data.filters.category }}
+    </section>
+    <section class="table-card">
+      <h4>Resumen comparativo</h4>
+      <table>
+        <thead><tr><th>Indicador</th><th>Actual</th><th>Anterior</th><th>Diferencia</th><th>Variación</th></tr></thead>
+        <tbody>
+          {% for row in comparison_rows %}
+          {% set difference = row.current - row.previous %}
+          {% set variation = (difference / row.previous * 100) if row.previous else none %}
+          <tr>
+            <td>{{ row.label }}</td>
+            <td>{% if row.currency %}RD$ {{ "{:,.2f}".format(row.current) }}{% else %}{{ "{:,}".format(row.current|int) }}{% endif %}</td>
+            <td>{% if row.currency %}RD$ {{ "{:,.2f}".format(row.previous) }}{% else %}{{ "{:,}".format(row.previous|int) }}{% endif %}</td>
+            <td class="{% if difference > 0 %}up{% elif difference < 0 %}down{% else %}flat{% endif %}">
+              {% if row.currency %}{{ difference|signed_money }}{% else %}{{ "{:+,}".format(difference|int) }}{% endif %}
+            </td>
+            <td class="{% if variation is none %}flat{% elif variation > 0 %}up{% elif variation < 0 %}down{% else %}flat{% endif %}">
+              {% if variation is none %}• Sin base{% elif variation > 0 %}▲ {{ "{:+.1f}%".format(variation) }}{% elif variation < 0 %}▼ {{ "{:+.1f}%".format(variation) }}{% else %}• 0.0%{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="chart-card full"><h4>Indicadores: actual frente al anterior</h4>{{ indicator_comparison_svg|safe }}</section>
+    <section class="table-card">
+      <h4>Comparación por categorías</h4>
+      <table>
+        <thead><tr><th>Categoría</th><th>Actual</th><th>Anterior</th><th>Diferencia</th><th>Variación</th></tr></thead>
+        <tbody>
+          {% for row in category_comparison_rows %}
+          {% set difference = row.current - row.previous %}
+          {% set variation = (difference / row.previous * 100) if row.previous else none %}
+          <tr>
+            <td>{{ row.label }}</td><td>RD$ {{ "{:,.2f}".format(row.current) }}</td><td>RD$ {{ "{:,.2f}".format(row.previous) }}</td>
+            <td class="{% if difference > 0 %}up{% elif difference < 0 %}down{% else %}flat{% endif %}">{{ difference|signed_money }}</td>
+            <td class="{% if variation is none %}flat{% elif variation > 0 %}up{% elif variation < 0 %}down{% else %}flat{% endif %}">{% if variation is none %}• Sin base{% elif variation > 0 %}▲ {{ "{:+.1f}%".format(variation) }}{% elif variation < 0 %}▼ {{ "{:+.1f}%".format(variation) }}{% else %}• 0.0%{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="chart-card full"><h4>Categorías: actual frente al anterior</h4>{{ category_comparison_svg|safe }}</section>
+    <section class="comparison-legend">▲ Aumento &nbsp;&nbsp; ▼ Disminución &nbsp;&nbsp; • Sin cambio o sin base comparable. Los símbolos mantienen la lectura al imprimir en blanco y negro.</section>
+  {% elif mode == "panel" %}
     {% set summary = data.summary %}
     <section class="filter-summary">
       <strong>Filtros:</strong>
-      ARS: {{ data.filters.ars }} · Facturador: {{ data.filters.user }} ·
-      Medicamento: {{ data.filters.medication }} · Categoría: {{ data.filters.category }}
+      ARS: {{ filter_ars }} · Facturadores: {{ filter_users }} · Cobertura: {{ data.filters.coverage }} ·
+      Categoría: {{ data.filters.category }} ·
+      Comparación: {{ "Sí" if data.filters.compare_previous else "No" }}
     </section>
-    <section class="kpi-grid three">
+    <section class="kpi-grid four">
       <article class="kpi blue"><span>Total de recibos</span><strong>{{ "{:,}".format(summary.receipts) }}</strong></article>
       <article class="kpi green"><span>Total emitido</span><strong>RD$ {{ "{:,.2f}".format(summary.total) }}</strong></article>
       <article class="kpi orange"><span>Promedio por recibo</span><strong>RD$ {{ "{:,.2f}".format(summary.average) }}</strong></article>
+      <article class="kpi blue"><span>Sala de emergencia</span><strong>RD$ {{ "{:,.2f}".format(summary.room) }}</strong></article>
     </section>
+
+    {% if data.filters.compare_previous %}
+    <section class="filter-summary">
+      <strong>Período anterior:</strong> {{ data.previous_start }} al {{ data.previous_end }} ·
+      Recibos: {{ data.previous.get('receipts', 0) }} ·
+      Total: RD$ {{ "{:,.2f}".format(data.previous.get('total', 0)) }} ·
+      Promedio: RD$ {{ "{:,.2f}".format(data.previous.get('average', 0)) }} ·
+      Sala: RD$ {{ "{:,.2f}".format(data.previous.get('room', 0)) }}
+    </section>
+    {% endif %}
 
     <section class="chart-grid">
       <article class="chart-card"><h4>Distribución porcentual por categoría</h4>{{ donut_svg|safe }}</article>
@@ -51,10 +126,15 @@
       </article>
       {% endif %}
       <article class="chart-card{% if not data.view.show_ars_comparison %} full{% endif %}">
-        <h4>Evolución diaria</h4>
+        <h4>Evolución temporal</h4>
         <p class="chart-subtitle">Métrica: {{ data.view.evolution_label }}</p>
         {{ line_svg|safe }}
       </article>
+      {% if data.coverage %}
+      <article class="chart-card full">
+        <h4>Distribución por tipo de cobertura</h4>{{ coverage_svg|safe }}
+      </article>
+      {% endif %}
     </section>
 
     {% if data.view.show_ars_comparison %}
@@ -76,6 +156,9 @@
     </section>
     {% endif %}
   {% else %}
+    {% if totals.get('_filter_summary') %}
+    <section class="filter-summary"><strong>Filtros aplicados:</strong> {{ totals.get('_filter_summary') }}</section>
+    {% endif %}
     <section class="kpi-grid three">
       <article class="kpi blue"><span>Total de recibos</span><strong>{{ totals.get('_total_recibos', 0) }}</strong></article>
       <article class="kpi green"><span>Total general emitido</span><strong>RD$ {{ "{:,.2f}".format(totals.get('Total General', 0)) }}</strong></article>
@@ -109,9 +192,9 @@
     </section>
   {% endif %}
 
-  <footer class="report-footer">
+  {% if mode != "comparison" %}<footer class="report-footer">
     <span>Criterio: fecha real de generación del recibo.</span>
     <span>Documento para control y auditoría.</span>
-  </footer>
+  </footer>{% endif %}
 </body>
 </html>

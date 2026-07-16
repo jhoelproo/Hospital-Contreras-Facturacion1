@@ -13,6 +13,12 @@ __pycache__/
 # Compilaciones y ejecutables
 build/
 dist/
+dist-preview/
+dist-preview-ux/
+dist-preview-reports/
+dist-preview-reports-v2/
+dist-preview-reports-v3/
+dist-preview-reports-v4/
 *.exe
 *.old
 *.zip
